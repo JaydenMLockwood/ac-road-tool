@@ -706,27 +706,30 @@ def ground_drop(lateral_from_road_edge: float) -> float:
     return SKIRT_DROP
 
 
-# ─── Real Terrain (lateral elevation grid) ────────────────────────────────────
+# ─── Real Terrain (world-space grid conformed to the road) ────────────────────
+# Instead of offsetting the centreline into lateral rings (which self-intersect
+# on tight corners and cross the road), a regular grid is sampled over a band
+# around the route and CONFORMED to the road: at the road it sits at road height;
+# moving outward it blends into the real DEM shape. The grid + an explicit collar
+# at the grass edge are triangulated (Delaunay) in world XZ, which cannot fold, so
+# hairpins and switchbacks are handled without terrain crossing the road, and the
+# road-height anchoring keeps the terrain seam-free with the road/grass regardless
+# of DEM noise or road smoothing. Standard "indent + surrounding" conform approach
+# (cf. EasyRoads3D / GIS road-flattening).
 
-def fetch_terrain_grid(mesh: dict, max_stations: int = 250) -> dict:
+TERRAIN_MAX_DIST  = 90.0    # how far terrain reaches from the road (m)
+TERRAIN_GRID_STEP = 12.0    # grid node spacing (m)
+TERRAIN_BLEND     = 40.0    # distance over which terrain blends road→DEM (m)
+
+
+def fetch_terrain_grid(mesh: dict) -> dict:
     """
-    Sample REAL elevation on a lateral grid beside the road: at stations
-    every ~15m+ along the centerline, query elevation at several offsets
-    each side. Cliffs, valleys and hillsides beside the road come from
-    real data. Returns {"stations": [cl indices], "rings": [m from
-    centerline], "deltas": (S, 2, R) array of height vs road} or None.
+    Sample the real DEM on a world-space grid over a band around the route,
+    plus along the road centreline for height anchoring. Returns everything
+    build_terrain_meshes needs, or None if the elevation APIs are unavailable.
     """
     cl = mesh["centerline"]
     proj_p = mesh["proj"]
-    hw = mesh["stats"]["road_width"] / 2.0
-    g0 = hw + GRASS_W
-    rings = [g0 + 10, g0 + 32, g0 + 65]             # metres from centerline
-
-    step = max(20, int(len(cl) / max_stations))
-    stations = list(range(0, len(cl), step))
-    if stations[-1] != len(cl) - 1:
-        stations.append(len(cl) - 1)
-    S, R = len(stations), len(rings)
 
     inv = Transformer.from_crs(
         f"+proj=tmerc +lat_0={proj_p['mid_lat']} +lon_0={proj_p['mid_lon']} +units=m",
@@ -737,129 +740,234 @@ def fetch_terrain_grid(mesh: dict, max_stations: int = 250) -> dict:
         lon, lat = inv.transform(x + ox, -(z + oz))   # undo handedness flip
         return [lat, lon]
 
-    # Build query list: per station — centre + R offsets each side
-    query = []
-    for si in stations:
-        p  = cl[si]
-        pn = cl[min(si + 1, len(cl) - 1)]
-        dx, dz = pn[0] - p[0], pn[2] - p[2]
-        L = math.hypot(dx, dz) or 1.0
-        px_, pz_ = -dz / L, dx / L
-        query.append(to_latlon(p[0], p[2]))
-        for side in (+1, -1):
-            for r in rings:
-                query.append(to_latlon(p[0] + side * px_ * r,
-                                       p[2] + side * pz_ * r))
+    # ── Road reference: resample the centreline ~every 6 m, carrying road
+    #    height, and sample the DEM at each reference point so terrain can be
+    #    anchored to the road's own elevation source (seam-free). ──
+    cl_xz = np.array([[p[0], p[2]] for p in cl])
+    seg = np.sqrt(((cl_xz[1:] - cl_xz[:-1]) ** 2).sum(axis=1))
+    arc = np.concatenate([[0.0], np.cumsum(seg)])
+    total = float(arc[-1])
+    n_ref = max(2, int(total / 6.0) + 1)
+    ref_d = np.linspace(0, total, n_ref)
+    rx = np.interp(ref_d, arc, cl_xz[:, 0])
+    rz = np.interp(ref_d, arc, cl_xz[:, 1])
+    ry = np.interp(ref_d, arc, np.array([p[1] for p in cl]))   # road height
+    ref_latlon = [to_latlon(float(rx[i]), float(rz[i])) for i in range(n_ref)]
 
-    print(f"  [terrain] sampling {len(query)} elevation points "
-          f"({S} stations × {2*R+1})…")
-    elevs = fetch_elevations(query, prefer_openmeteo=True)  # big batch: roomier limits
+    # ── Grid over the route's bounding box, padded by the reach distance ──
+    pad = TERRAIN_MAX_DIST + TERRAIN_GRID_STEP
+    min_x = float(cl_xz[:, 0].min()) - pad
+    max_x = float(cl_xz[:, 0].max()) + pad
+    min_z = float(cl_xz[:, 1].min()) - pad
+    max_z = float(cl_xz[:, 1].max()) + pad
+    gx = np.arange(min_x, max_x + TERRAIN_GRID_STEP, TERRAIN_GRID_STEP)
+    gz = np.arange(min_z, max_z + TERRAIN_GRID_STEP, TERRAIN_GRID_STEP)
+    nX, nZ = len(gx), len(gz)
+
+    # Nearest road reference per node → distance + anchor index
+    from scipy.spatial import cKDTree
+    kd = cKDTree(np.column_stack([rx, rz]))
+    GX, GZ = np.meshgrid(gx, gz, indexing="ij")          # (nX, nZ)
+    flat_xz = np.column_stack([GX.ravel(), GZ.ravel()])
+    dist_flat, near_flat = kd.query(flat_xz)
+    dist = dist_flat.reshape(nX, nZ)
+    near = near_flat.reshape(nX, nZ).astype(int)
+
+    # Only nodes within reach need a real DEM sample; the rest stay unused.
+    within = dist <= (TERRAIN_MAX_DIST + TERRAIN_GRID_STEP)
+    node_ids = [tuple(map(int, ij)) for ij in np.argwhere(within)]
+    node_latlon = [to_latlon(float(GX[i, j]), float(GZ[i, j])) for i, j in node_ids]
+
+    # ── One batched DEM fetch: road references + grid nodes ──
+    query = ref_latlon + node_latlon
+    print(f"  [terrain] sampling {len(query)} DEM points "
+          f"({n_ref} road refs + {len(node_latlon)} grid nodes, "
+          f"{nX}×{nZ} grid)…")
+    elevs = fetch_elevations(query, prefer_openmeteo=True)
     if elevs is None:
         print("  [terrain] elevation APIs unavailable — flat skirt fallback")
         return None
 
-    per = 2 * R + 1
-    deltas = np.zeros((S, 2, R))
-    for i in range(S):
-        base = elevs[i * per]
-        for s in range(2):                     # 0 = left(+), 1 = right(-)
-            for r in range(R):
-                e = elevs[i * per + 1 + s * R + r]
-                d = (e - base) if (e is not None and base is not None) else 0.0
-                deltas[i, s, r] = max(-120.0, min(120.0, d))
-    return {"stations": stations, "rings": rings, "deltas": deltas}
+    dem_ref = np.array(elevs[:n_ref], dtype=float)
+    dem_node = {}
+    for k, (i, j) in enumerate(node_ids):
+        dem_node[(i, j)] = float(elevs[n_ref + k])
+
+    return {
+        "gx": gx, "gz": gz, "nX": nX, "nZ": nZ,
+        "dist": dist, "near": near, "within": within,
+        "rx": rx, "rz": rz, "ry": ry,
+        "dem_ref": dem_ref, "dem_node": dem_node,
+    }
 
 
-def build_terrain_meshes(mesh: dict, tgrid: dict) -> list:
+def build_terrain_meshes(mesh: dict, grid: dict) -> list:
     """
-    Mesh the real-elevation lateral grid into two physical terrain strips
-    (1GRASS_TL / 1GRASS_TR). Returns [(name, kn5_verts, indices, mat_key)].
+    Triangulate the conformed grid + a grass-edge collar into physical terrain
+    (1GRASS_* → AC GRASS surface, so leaving the road lands on real ground).
+    At the road the surface sits at grass-edge height; it blends into the real
+    DEM shape over TERRAIN_BLEND metres. Returns
+    [(name, kn5_verts, indices, "terrain")].
     """
-    cl = mesh["centerline"]
+    from scipy.spatial import Delaunay, cKDTree
+
     hw = mesh["stats"]["road_width"] / 2.0
-    g0 = hw + GRASS_W
-    stations = tgrid["stations"]
-    rings    = tgrid["rings"]
-    deltas   = tgrid["deltas"]
-    S, R = len(stations), len(rings)
-    ring_d = [g0] + list(rings)                 # ring 0 = grass outer edge
+    grass_w = mesh["stats"].get("grass_width", GRASS_W)
+    g_drop  = mesh["stats"].get("grass_drop", GRASS_DROP)
+    indent  = hw + grass_w                 # corridor edge = grass outer edge
 
+    gx = grid["gx"]; gz = grid["gz"]
+    dist = grid["dist"]; near = grid["near"]
+    rx = grid["rx"]; rz = grid["rz"]; ry = grid["ry"]
+    dem_ref = grid["dem_ref"]; dem_node = grid["dem_node"]
+
+    pts = []      # (x, z)
+    ys  = []      # height
+
+    # True distance to the FULL centreline (not the 6m road refs, whose
+    # polyline cuts corners and underestimates closeness on curves — which
+    # otherwise lets terrain spill onto the road on bends).
+    cl_xz = np.array([[p[0], p[2]] for p in mesh["centerline"]])
+    kd_cl = cKDTree(cl_xz)
+
+    # ── Exterior grid nodes (outside the road corridor), conformed height ──
+    # y = grass_edge_height + (DEM_here − DEM_at_nearest_road) · blend(dist)
+    for (i, j), dv in dem_node.items():
+        nx0, nz0 = float(gx[i]), float(gz[j])
+        d, _ = kd_cl.query([nx0, nz0])       # true distance to road
+        if d < indent:
+            continue                       # corridor interior: road covers it
+        a = int(near[i, j])
+        base = ry[a] - g_drop
+        w = (d - indent) / TERRAIN_BLEND
+        w = 0.0 if w < 0 else (1.0 if w > 1 else w)
+        pts.append((nx0, nz0))
+        ys.append(base + (dv - dem_ref[a]) * w)
+
+    # ── Collar at the grass outer edge (both sides of the road) ──
+    # A dense inner boundary at exactly the grass-edge height, so terrain meets
+    # the road's grass strip watertight and no gap can open where the grid
+    # lattice misses the road.
+    n_ref = len(rx)
+    # Collar sits at the corridor edge — which is the road edge when
+    # grass_width is 0, so terrain meets the road flush. Never inside the road.
+    floor = hw
+    for i in range(n_ref):
+        i0 = max(i - 1, 0); i1 = min(i + 1, n_ref - 1)
+        dx = rx[i1] - rx[i0]; dz = rz[i1] - rz[i0]
+        L = math.hypot(dx, dz) or 1.0
+        px_, pz_ = -dz / L, dx / L
+        # Local radius of curvature (circumcircle of the three refs); on the
+        # inside of a bend tighter than the collar offset, an offset would fold
+        # across the road, so cap it to 0.8·R (floored just past the road edge).
+        ax, az = rx[i0], rz[i0]; bx, bz = rx[i], rz[i]; cxr, czr = rx[i1], rz[i1]
+        det = 2.0 * (ax * (bz - czr) + bx * (czr - az) + cxr * (az - bz))
+        Ox = Oz = None
+        if abs(det) > 1e-9:
+            a2 = ax*ax + az*az; b2 = bx*bx + bz*bz; c2 = cxr*cxr + czr*czr
+            Ox = (a2*(bz - czr) + b2*(czr - az) + c2*(az - bz)) / det
+            Oz = (a2*(cxr - bx) + b2*(ax - cxr) + c2*(bx - ax)) / det
+            Rc = math.hypot(bx - Ox, bz - Oz)
+        for side in (+1, -1):
+            d_off = indent
+            if Ox is not None and Rc < 1e4:
+                if side * (px_ * (Ox - bx) + pz_ * (Oz - bz)) > 0:   # inside
+                    d_off = min(indent, 0.8 * Rc)
+            d_off = max(floor, d_off)
+            cxp = rx[i] + side * px_ * d_off
+            czp = rz[i] + side * pz_ * d_off
+            # A ref-perpendicular offset can still land inside the road on a
+            # bend (nearest true-centreline point differs from the ref); push
+            # it back out to the road edge so terrain never covers the road.
+            dcl, ci = kd_cl.query([cxp, czp])
+            if dcl < hw:
+                ox0, oz0 = cl_xz[ci]
+                vx, vz = cxp - ox0, czp - oz0
+                vl = math.hypot(vx, vz) or 1.0
+                cxp = ox0 + vx / vl * hw
+                czp = oz0 + vz / vl * hw
+            pts.append((cxp, czp))
+            ys.append(ry[i] - g_drop)
+
+    if len(pts) < 3:
+        return []
+    pts = np.array(pts, dtype=float)
+    ys  = np.array(ys, dtype=float)
+    pos = np.column_stack([pts[:, 0], ys, pts[:, 1]])   # (N,3) world xyz
+
+    tri = Delaunay(pts)
+    max_edge = 3.0 * TERRAIN_GRID_STEP     # drop triangles that span the road
+
+    # Keep only triangles that don't cross the road and don't span a wide gap
+    # (e.g. across a hairpin throat). Distance is to the FULL centreline, and
+    # a triangle is rejected if its centroid OR any vertex sits inside the road.
+    keep = []
+    for s in tri.simplices:
+        p = pts[s]
+        e = max(math.hypot(*(p[0] - p[1])),
+                math.hypot(*(p[1] - p[2])),
+                math.hypot(*(p[2] - p[0])))
+        if e > max_edge:
+            continue
+        cx, cz = p.mean(axis=0)
+        dc, _ = kd_cl.query([cx, cz])
+        dv, _ = kd_cl.query(p)             # distance of each vertex to road
+        if dc < hw or float(dv.min()) < hw - 0.05:   # over the road → drop
+            continue
+        keep.append(s)
+    if not keep:
+        return []
+
+    # ── Vertex normals from accumulated face normals ──
+    nrm = np.zeros((len(pts), 3))
+    for s in keep:
+        p0, p1, p2 = pos[s]
+        n = np.cross(p1 - p0, p2 - p0)
+        if n[1] < 0:
+            n = -n
+        nrm[s] += n
+    ln = np.linalg.norm(nrm, axis=1)
+    ln[ln == 0] = 1.0
+    nrm = nrm / ln[:, None]
+
+    # ── Emit triangles, chunked under the KN5 65k-vertex limit ──
     out = []
-    for s_i, side in ((0, +1), (1, -1)):
-        # vertex grid: rows = stations, cols = rings (grass edge → outermost)
-        grid = []                                # (S, R+1) of (x, y, z)
-        for i, ci in enumerate(stations):
-            p  = cl[ci]
-            pn = cl[min(ci + 1, len(cl) - 1)]
-            dx, dz = pn[0] - p[0], pn[2] - p[2]
-            L = math.hypot(dx, dz) or 1.0
-            px_, pz_ = -dz / L, dx / L
-            row = []
-            for r, d in enumerate(ring_d):
-                x = p[0] + side * px_ * d
-                z = p[2] + side * pz_ * d
-                if r == 0:
-                    y = p[1] - GRASS_DROP
-                else:
-                    y = p[1] + float(deltas[i, s_i, r - 1])
-                row.append((x, y, z))
-            grid.append(row)
+    part = 0
+    verts, idx, vmap = [], [], {}
 
-        # verts with normals from grid neighbours
-        kv = []
-        C = R + 1
-        for i in range(S):
-            for r in range(C):
-                x, y, z = grid[i][r]
-                i2 = min(i + 1, S - 1); i1 = max(i - 1, 0)
-                r2 = min(r + 1, C - 1); r1 = max(r - 1, 0)
-                a = np.array(grid[i2][r]) - np.array(grid[i1][r])
-                b = np.array(grid[i][r2]) - np.array(grid[i][r1])
-                n = np.cross(a, b)
-                ln = np.linalg.norm(n) or 1.0
-                n = n / ln
-                if n[1] < 0:
-                    n = -n
-                uv = (r / R, (stations[i] / max(1, len(cl))) * 40.0)
-                kv.append(((x, y, z), tuple(n), uv, (1.0, 0.0, 0.0)))
+    def flush():
+        nonlocal verts, idx, vmap, part
+        if verts:
+            name = "1GRASS_TER" if part == 0 else f"1GRASS_TER_{part}"
+            out.append((name, verts, idx, "terrain"))
+            part += 1
+        verts, idx, vmap = [], [], {}
 
-        idx = []
-        for i in range(S - 1):
-            for r in range(C - 1):
-                a = i * C + r
-                b = a + 1
-                c = a + C
-                d = c + 1
-                # geometric up-winding check on first quad orientation
-                idx.extend((a, d, b)); idx.extend((a, c, d))
-        # fix winding: test one quad's geometric normal
-        p0 = np.array(kv[0][0]); p1 = np.array(kv[1][0]); pc = np.array(kv[C][0])
-        gy = np.cross(pc - p0, p1 - p0)[1]
-        if gy < 0:
-            fixed = []
-            for j in range(0, len(idx), 3):
-                fixed.extend((idx[j], idx[j+2], idx[j+1]))
-            idx = fixed
+    def vid(k):
+        vi = vmap.get(k)
+        if vi is None:
+            x, y, z = pos[k]
+            nx_, ny_, nz_ = nrm[k]
+            vi = len(verts)
+            verts.append(((float(x), float(y), float(z)),
+                          (float(nx_), float(ny_), float(nz_)),
+                          (float(x) / 20.0, float(z) / 20.0),
+                          (1.0, 0.0, 0.0)))
+            vmap[k] = vi
+        return vi
 
-        name = "1GRASS_TL" if side > 0 else "1GRASS_TR"
-        # chunk if oversized (rare)
-        if len(kv) <= 60000:
-            out.append((name, kv, idx, "terrain"))
+    for s in keep:
+        if len(verts) + 3 > 60000:
+            flush()
+        p0, p1, p2 = pos[s]
+        gy = np.cross(p1 - p0, p2 - p0)[1]     # up-facing winding
+        a, b, c = int(s[0]), int(s[1]), int(s[2])
+        if gy >= 0:
+            idx.extend((vid(a), vid(b), vid(c)))
         else:
-            rows_per = 60000 // C
-            part = 0
-            r0 = 0
-            while r0 < S - 1:
-                r1 = min(r0 + rows_per, S)
-                sub_kv = kv[r0*C:r1*C]
-                sub_idx = []
-                for i in range(r1 - r0 - 1):
-                    for r in range(C - 1):
-                        a = i * C + r
-                        sub_idx.extend((a, a+C+1, a+1, a, a+C, a+C+1))
-                out.append((f"{name}_{part}", sub_kv, sub_idx, "terrain"))
-                r0 = r1 - 1
-                part += 1
+            idx.extend((vid(a), vid(c), vid(b)))
+    flush()
+
     return out
 
 def process_road(coords: list, road_width: float = 8.0,
@@ -937,8 +1045,10 @@ def process_road(coords: list, road_width: float = 8.0,
     nx = -dzs / lengths_xz
     nz =  dxs / lengths_xz
     hw = road_width / 2.0
-    gw = GRASS_W
-    g_drop = GRASS_DROP
+    gw = grass_width
+    # verge drop scales with verge width (a 0.5m verge shouldn't be a cliff);
+    # at grass_width=0 the drop is 0, so terrain meets the road edge flush.
+    g_drop = GRASS_DROP * (grass_width / GRASS_W) if GRASS_W else 0.0
     lx = xs + nx*hw;  lz = zs + nz*hw
     rx = xs - nx*hw;  rz = zs - nz*hw
     # Grass outer edges
@@ -1038,6 +1148,8 @@ def process_road(coords: list, road_width: float = 8.0,
             "point_count":    n_pts,
             "corners":        corners,
             "road_width":     road_width,
+            "grass_width":    grass_width,
+            "grass_drop":     g_drop,
             "elev_min_m":     round(float(ys.min()), 1),
             "elev_max_m":     round(float(ys.max()), 1),
             "elev_range_m":   round(float(ys.max()-ys.min()), 1),
@@ -1899,8 +2011,13 @@ def export_ac_package(coords: list, road_width: float,
     elev_profile = fetch_elevation_profile(coords)
     print(f"  [export] Elevation {'OK' if elev_profile else 'flat'}")
 
+    # When real terrain will be laid, drop the wide grass verge so the terrain
+    # meets the road edge directly; when it won't, keep the 10m grass verge.
+    # Elevation availability predicts terrain; if it turns out unavailable we
+    # rebuild the road mesh with the full verge restored.
+    grass_w = 0.0 if elev_profile else GRASS_W
     mesh = process_road(coords, road_width, smooth_factor,
-                        elev_profile=elev_profile)
+                        elev_profile=elev_profile, grass_width=grass_w)
     if "error" in mesh:
         return mesh
 
@@ -1918,6 +2035,14 @@ def export_ac_package(coords: list, road_width: float,
                       f"{sum(len(kv) for _, kv, _, _ in terrain_meshes)} verts")
         except Exception as e:
             print(f"  [export] Terrain grid skipped: {e}")
+
+    # Terrain didn't materialise despite having elevation — restore the wide
+    # grass verge (the road-edge grass was only to make room for terrain).
+    if elev_profile and not terrain_meshes:
+        print("  [export] No terrain built — restoring 10m grass verge")
+        mesh = process_road(coords, road_width, smooth_factor,
+                            elev_profile=elev_profile, grass_width=GRASS_W)
+        ground_pts = None
 
     env_meshes = None
     n_bldg = n_tree = 0
