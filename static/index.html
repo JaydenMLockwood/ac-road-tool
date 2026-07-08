@@ -1,0 +1,1011 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AC Road Tool</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Rajdhani:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+
+  :root {
+    --bg0: #0a0b0d;
+    --bg1: #111318;
+    --bg2: #1a1d24;
+    --bg3: #22262f;
+    --border: #2a2f3a;
+    --accent: #e8b84b;
+    --accent2: #ff6b35;
+    --green: #4caf7d;
+    --red: #e85555;
+    --text: #d4d8e2;
+    --text2: #7a8099;
+    --text3: #4a5068;
+    --font: 'Rajdhani', sans-serif;
+    --mono: 'JetBrains Mono', monospace;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background: var(--bg0);
+    color: var(--text);
+    font-family: var(--font);
+    font-size: 15px;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  /* ── Header ── */
+  header {
+    background: var(--bg1);
+    border-bottom: 1px solid var(--border);
+    padding: 0 20px;
+    height: 52px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-shrink: 0;
+    position: relative;
+  }
+  header::after {
+    content: '';
+    position: absolute;
+    bottom: 0; left: 0; right: 0;
+    height: 1px;
+    background: linear-gradient(90deg, transparent, var(--accent) 30%, var(--accent2) 70%, transparent);
+    opacity: 0.4;
+  }
+  .logo {
+    font-size: 20px;
+    font-weight: 700;
+    letter-spacing: 0.15em;
+    text-transform: uppercase;
+    color: var(--accent);
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .logo-icon {
+    width: 28px; height: 28px;
+    border: 2px solid var(--accent);
+    border-radius: 4px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 14px;
+  }
+  .logo span { color: var(--text2); font-weight: 400; }
+  .status-bar {
+    display: flex; align-items: center; gap: 16px;
+    font-family: var(--mono); font-size: 11px; color: var(--text3);
+  }
+  .status-dot {
+    width: 6px; height: 6px; border-radius: 50%;
+    background: var(--green);
+    box-shadow: 0 0 6px var(--green);
+  }
+
+  /* ── Layout ── */
+  .app {
+    display: flex;
+    flex: 1;
+    overflow: hidden;
+  }
+
+  /* ── Sidebar ── */
+  .sidebar {
+    width: 320px;
+    background: var(--bg1);
+    border-right: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    flex-shrink: 0;
+    overflow-y: auto;
+  }
+
+  .section {
+    border-bottom: 1px solid var(--border);
+    padding: 16px;
+  }
+  .section-label {
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+    color: var(--text3);
+    margin-bottom: 12px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .section-label::before {
+    content: '';
+    width: 3px; height: 12px;
+    background: var(--accent);
+    border-radius: 2px;
+  }
+
+  /* ── Search ── */
+  .search-wrap {
+    position: relative;
+  }
+  .search-input {
+    width: 100%;
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 10px 40px 10px 12px;
+    color: var(--text);
+    font-family: var(--font);
+    font-size: 14px;
+    outline: none;
+    transition: border-color 0.15s;
+  }
+  .search-input:focus { border-color: var(--accent); }
+  .search-input::placeholder { color: var(--text3); }
+  .search-btn {
+    position: absolute;
+    right: 8px; top: 50%;
+    transform: translateY(-50%);
+    background: none;
+    border: none;
+    color: var(--text2);
+    cursor: pointer;
+    padding: 4px;
+    font-size: 16px;
+    transition: color 0.15s;
+  }
+  .search-btn:hover { color: var(--accent); }
+
+  /* ── Results list ── */
+  .results {
+    margin-top: 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    max-height: 220px;
+    overflow-y: auto;
+  }
+  .result-item {
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    padding: 9px 11px;
+    cursor: pointer;
+    transition: all 0.12s;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+  .result-item:hover { border-color: var(--accent); background: var(--bg3); }
+  .result-item.active { border-color: var(--accent); background: var(--bg3); }
+  .result-name {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .result-sub {
+    font-size: 11px;
+    color: var(--text3);
+    font-family: var(--mono);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  /* ── Track Name ── */
+  .field-label {
+    font-size: 11px;
+    color: var(--text2);
+    margin-bottom: 5px;
+    font-weight: 600;
+    letter-spacing: 0.05em;
+  }
+  .text-input {
+    width: 100%;
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 8px 12px;
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 13px;
+    outline: none;
+    transition: border-color 0.15s;
+  }
+  .text-input:focus { border-color: var(--accent); }
+
+  /* ── Sliders ── */
+  .param-row {
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+    margin-bottom: 12px;
+  }
+  .param-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+  .param-val {
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--accent);
+  }
+  input[type=range] {
+    width: 100%;
+    -webkit-appearance: none;
+    height: 3px;
+    background: var(--bg3);
+    border-radius: 2px;
+    outline: none;
+  }
+  input[type=range]::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    width: 14px; height: 14px;
+    border-radius: 50%;
+    background: var(--accent);
+    cursor: pointer;
+    box-shadow: 0 0 6px rgba(232, 184, 75, 0.4);
+  }
+
+  /* ── Stats ── */
+  .stats-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+  }
+  .stat-box {
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    padding: 10px;
+    text-align: center;
+  }
+  .stat-val {
+    font-family: var(--mono);
+    font-size: 20px;
+    font-weight: 500;
+    color: var(--accent);
+    line-height: 1;
+    margin-bottom: 3px;
+  }
+  .stat-label {
+    font-size: 10px;
+    color: var(--text3);
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+  }
+
+  /* ── Buttons ── */
+  .btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 7px;
+    padding: 11px 16px;
+    border-radius: 6px;
+    border: 1px solid transparent;
+    font-family: var(--font);
+    font-size: 14px;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    cursor: pointer;
+    transition: all 0.15s;
+    width: 100%;
+    text-transform: uppercase;
+  }
+  .btn-primary {
+    background: var(--accent);
+    color: #0a0b0d;
+    border-color: var(--accent);
+  }
+  .btn-primary:hover { background: #f0c55a; }
+  .btn-secondary {
+    background: transparent;
+    color: var(--text);
+    border-color: var(--border);
+  }
+  .btn-secondary:hover { border-color: var(--text2); background: var(--bg2); }
+  .btn:disabled {
+    opacity: 0.35;
+    cursor: not-allowed;
+  }
+  .btn-row {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 16px;
+  }
+
+  /* ── Toast ── */
+  #toast {
+    position: fixed;
+    bottom: 24px; left: 50%;
+    transform: translateX(-50%) translateY(20px);
+    background: var(--bg3);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px 20px;
+    font-size: 13px;
+    font-family: var(--mono);
+    opacity: 0;
+    pointer-events: none;
+    transition: all 0.25s;
+    z-index: 9999;
+    max-width: 400px;
+    text-align: center;
+  }
+  #toast.show {
+    opacity: 1;
+    transform: translateX(-50%) translateY(0);
+  }
+  #toast.success { border-color: var(--green); color: var(--green); }
+  #toast.error { border-color: var(--red); color: var(--red); }
+  #toast.info { border-color: var(--accent); color: var(--accent); }
+
+  /* ── Progress ── */
+  .progress-wrap {
+    height: 2px;
+    background: var(--border);
+    border-radius: 1px;
+    overflow: hidden;
+    margin-top: 8px;
+    display: none;
+  }
+  .progress-wrap.show { display: block; }
+  .progress-bar {
+    height: 100%;
+    background: linear-gradient(90deg, var(--accent), var(--accent2));
+    border-radius: 1px;
+    transition: width 0.3s;
+    width: 0%;
+  }
+
+  /* ── Map ── */
+  #map {
+    flex: 1;
+    width: 100%;
+    height: 100%;
+    min-height: 0;
+    background: var(--bg0);
+    z-index: 1;
+  }
+
+  /* Leaflet dark overrides */
+  .leaflet-container {
+    background: #0e1016 !important;
+    font-family: var(--font) !important;
+  }
+  .leaflet-control-zoom a {
+    background: var(--bg2) !important;
+    color: var(--text) !important;
+    border-color: var(--border) !important;
+  }
+  .leaflet-control-zoom a:hover {
+    background: var(--bg3) !important;
+    color: var(--accent) !important;
+  }
+
+  /* ── Right panel overlay ── */
+  .map-overlay {
+    position: absolute;
+    top: 16px; right: 16px;
+    z-index: 500;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    pointer-events: none;
+  }
+  .map-badge {
+    background: rgba(10, 11, 13, 0.85);
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    padding: 8px 12px;
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--text2);
+    backdrop-filter: blur(8px);
+    pointer-events: all;
+  }
+  .map-badge strong { color: var(--accent); }
+
+  /* ── Loading spinner ── */
+  .spinner {
+    width: 14px; height: 14px;
+    border: 2px solid var(--border);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.7s linear infinite;
+    display: none;
+  }
+  .spinner.show { display: inline-block; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* ── Empty state ── */
+  .empty-msg {
+    color: var(--text3);
+    font-size: 12px;
+    text-align: center;
+    padding: 12px 0;
+    font-family: var(--mono);
+  }
+
+  /* scrollbar */
+  ::-webkit-scrollbar { width: 4px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="logo">
+    <div class="logo-icon">AC</div>
+    Road Tool <span>/ OSM to Assetto Corsa</span>
+  </div>
+  <div class="status-bar">
+    <div class="status-dot" id="statusDot"></div>
+    <span id="statusText">ready</span>
+    <div class="spinner" id="globalSpinner"></div>
+  </div>
+</header>
+
+<div class="app">
+  <aside class="sidebar">
+
+    <!-- Search -->
+    <div class="section">
+      <div class="section-label">Search Road</div>
+      <div class="search-wrap">
+        <input class="search-input" id="searchInput" type="text"
+          placeholder="e.g. Stelvio Pass, Nürburgring, Crown Street…"
+          autocomplete="off"/>
+        <button class="search-btn" id="searchBtn" title="Search">⌕</button>
+      </div>
+      <div class="progress-wrap" id="searchProgress">
+        <div class="progress-bar" id="searchBar" style="width:60%"></div>
+      </div>
+      <div class="results" id="resultsList">
+        <div class="empty-msg">Enter a road name above</div>
+      </div>
+    </div>
+
+    <!-- Track name -->
+    <div class="section">
+      <div class="section-label">Track Name</div>
+      <div class="field-label">Internal name (no spaces)</div>
+      <input class="text-input" id="trackName" type="text" value="my_road"
+        placeholder="my_road"/>
+    </div>
+
+    <!-- Direct install -->
+    <div class="section">
+      <div class="section-label">1-Click Install <span style="font-weight:400; color:var(--text3);">(optional)</span></div>
+      <div class="field-label">Assetto Corsa folder — installs the track directly on export</div>
+      <input class="text-input" id="acPath" type="text" value=""
+        placeholder="C:\Program Files (x86)\Steam\steamapps\common\assettocorsa"/>
+      <label style="display:flex;align-items:center;gap:8px;margin-top:10px;cursor:pointer;font-size:13px;color:var(--text2);">
+        <input type="checkbox" id="includeEnv" checked style="accent-color:#e8b84b;"/>
+        Include surroundings — buildings &amp; trees from OpenStreetMap
+      </label>
+    </div>
+
+    <!-- Parameters -->
+    <div class="section">
+      <div class="section-label">Parameters</div>
+
+      <div class="param-row">
+        <div class="param-head">
+          <span class="field-label">Road Width</span>
+          <span class="param-val" id="widthVal">8 m</span>
+        </div>
+        <input type="range" id="widthSlider" min="4" max="20" step="0.5" value="8">
+      </div>
+
+      <div class="param-row">
+        <div class="param-head">
+          <span class="field-label">GPS Smoothing</span>
+          <span class="param-val" id="smoothVal">30%</span>
+        </div>
+        <input type="range" id="smoothSlider" min="0" max="100" step="5" value="30">
+      </div>
+    </div>
+
+    <!-- Stats -->
+    <div class="section" id="statsSection" style="display:none">
+      <div class="section-label">Track Stats</div>
+      <div class="stats-grid">
+        <div class="stat-box">
+          <div class="stat-val" id="statLength">—</div>
+          <div class="stat-label">Length km</div>
+        </div>
+        <div class="stat-box">
+          <div class="stat-val" id="statCorners">—</div>
+          <div class="stat-label">Corners</div>
+        </div>
+        <div class="stat-box">
+          <div class="stat-val" id="statClimb">—</div>
+          <div class="stat-label">Climb m</div>
+        </div>
+        <div class="stat-box">
+          <div class="stat-val" id="statRange">—</div>
+          <div class="stat-label">Elev range m</div>
+        </div>
+      </div>
+      <!-- Elevation profile chart -->
+      <div id="elevChartWrap" style="display:none; margin-top:12px;">
+        <div style="font-size:10px; color:var(--text3); letter-spacing:0.12em; text-transform:uppercase; margin-bottom:6px;">
+          Elevation profile
+        </div>
+        <canvas id="elevChart" height="72" style="width:100%; display:block; border-radius:4px;"></canvas>
+        <div style="display:flex; justify-content:space-between; margin-top:3px;">
+          <span style="font-family:var(--mono); font-size:10px; color:var(--text3)" id="elevMin">—</span>
+          <span style="font-family:var(--mono); font-size:10px; color:var(--text3)" id="elevMax">—</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Actions -->
+    <div class="btn-row">
+      <button class="btn btn-secondary" id="previewBtn" disabled>
+        ▶ Preview Mesh Stats
+      </button>
+      <button class="btn btn-primary" id="exportBtn" disabled>
+        ⬇ Export AC Package
+      </button>
+    </div>
+
+    <!-- Download link -->
+    <div id="downloadSection" style="display:none; padding:0 16px 16px;">
+      <div class="stat-box" style="text-align:left; padding:12px;">
+        <div style="font-size:11px; color:var(--text3); margin-bottom:6px; font-family:var(--mono);">EXPORT READY</div>
+        <a id="downloadLink" href="#" style="color:var(--green); font-weight:700; font-size:14px; text-decoration:none;">
+          ⬇ Download .zip
+        </a>
+        <div id="exportInfo" style="font-size:11px; color:var(--text3); margin-top:4px; font-family:var(--mono);"></div>
+      </div>
+    </div>
+
+  </aside>
+
+  <div style="flex:1; position:relative; display:flex; flex-direction:column; overflow:hidden;">
+    <div id="map" style="flex:1; width:100%; height:100%;"></div>
+    <div class="map-overlay">
+      <div class="map-badge" id="coordBadge" style="display:none">
+        <strong id="coordText">—</strong>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="toast"></div>
+
+<script>
+// ── State ──────────────────────────────────────────────────────────────────
+const state = {
+  selectedResult: null,
+  coords: [],         // trimmed [[lat, lon], ...] — used by preview/export
+  fullCoords: [],     // full loaded route
+  trim: { i0: 0, i1: 0 },
+  processing: false,
+};
+
+// ── Map ────────────────────────────────────────────────────────────────────
+const map = L.map('map', {
+  center: [48.8, 9.2],
+  zoom: 5,
+  zoomControl: true,
+});
+
+L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+  attribution: '© OpenStreetMap, © CARTO',
+  subdomains: 'abcd',
+  maxZoom: 19,
+}).addTo(map);
+
+// Force Leaflet to recalculate its container size after DOM is ready
+setTimeout(() => map.invalidateSize(), 100);
+
+// Track all road layers so we can cleanly remove them on re-selection
+const roadLayers = [];
+
+map.on('mousemove', (e) => {
+  const b = document.getElementById('coordBadge');
+  const t = document.getElementById('coordText');
+  b.style.display = 'block';
+  t.textContent = `${e.latlng.lat.toFixed(5)}, ${e.latlng.lng.toFixed(5)}`;
+});
+
+// ── UI helpers ─────────────────────────────────────────────────────────────
+function toast(msg, type='info', duration=3200) {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.className = `show ${type}`;
+  clearTimeout(el._timer);
+  el._timer = setTimeout(() => { el.className = ''; }, duration);
+}
+
+function setLoading(on) {
+  document.getElementById('globalSpinner').classList.toggle('show', on);
+  document.getElementById('statusDot').style.background = on ? 'var(--accent)' : 'var(--green)';
+  document.getElementById('statusText').textContent = on ? 'working…' : 'ready';
+  state.processing = on;
+}
+
+function setProgress(el, show) {
+  document.getElementById(el).classList.toggle('show', show);
+}
+
+// ── Search ─────────────────────────────────────────────────────────────────
+async function doSearch() {
+  const q = document.getElementById('searchInput').value.trim();
+  if (!q) return;
+
+  setLoading(true);
+  setProgress('searchProgress', true);
+  document.getElementById('resultsList').innerHTML = '<div class="empty-msg">Searching…</div>';
+
+  try {
+    const res = await fetch(`/api/search?q=${encodeURIComponent(q)}`);
+    const data = await res.json();
+
+    setProgress('searchProgress', false);
+
+    if (data.error) { toast(data.error, 'error'); return; }
+
+    const results = data.results || [];
+    const list = document.getElementById('resultsList');
+
+    if (!results.length) {
+      list.innerHTML = '<div class="empty-msg">No roads found — try a different name</div>';
+      return;
+    }
+
+    list.innerHTML = '';
+    results.forEach((r, i) => {
+      const parts = r.display_name.split(', ');
+      const name = parts[0];
+      const sub = parts.slice(1, 4).join(', ');
+
+      const div = document.createElement('div');
+      div.className = 'result-item';
+      div.innerHTML = `
+        <div class="result-name">${name}</div>
+        <div class="result-sub">${sub}</div>
+      `;
+      div.addEventListener('click', () => selectResult(r, div));
+      list.appendChild(div);
+    });
+
+    // Auto-select first
+    selectResult(results[0], list.firstChild);
+
+  } catch(e) {
+    toast('Search failed — is the server running?', 'error');
+  } finally {
+    setLoading(false);
+  }
+}
+
+async function selectResult(result, el) {
+  // Highlight UI
+  document.querySelectorAll('.result-item').forEach(e => e.classList.remove('active'));
+  if (el) el.classList.add('active');
+
+  state.selectedResult = result;
+
+  // Auto-fill track name from road name
+  const rawName = result.display_name.split(',')[0]
+    .replace(/[^a-zA-Z0-9 ]/g, '').trim().replace(/\s+/g, '_').toLowerCase().slice(0, 28);
+  document.getElementById('trackName').value = rawName || 'my_road';
+
+  // Fly map to bounding box
+  if (result.boundingbox && result.boundingbox.length === 4) {
+    const [s, n, w, e] = result.boundingbox.map(Number);
+    map.fitBounds([[s, w], [n, e]], { padding: [40, 40] });
+  } else {
+    map.setView([result.lat, result.lon], 14);
+  }
+
+  // Fetch geometry
+  setLoading(true);
+  toast('Fetching road geometry…', 'info');
+
+  try {
+    const res = await fetch(`/api/geometry?type=${result.osm_type}&id=${result.osm_id}`);
+    const data = await res.json();
+
+    if (data.error || !data.coords || !data.coords.length) {
+      toast(`Geometry error: ${data.error || 'no data'}`, 'error');
+      return;
+    }
+
+    state.coords = data.coords;
+    drawRoad(data.coords);
+
+    document.getElementById('previewBtn').disabled = false;
+    document.getElementById('exportBtn').disabled = false;
+
+    toast(`Loaded ${data.coords.length} GPS points`, 'success');
+
+  } catch(e) {
+    toast('Failed to fetch road geometry', 'error');
+  } finally {
+    setLoading(false);
+  }
+}
+
+// ── Draw road on map (with draggable start/end trim markers) ───────────────
+function nearestCoordIndex(latlng, coords) {
+  let best = 0, bestD = Infinity;
+  const cosLat = Math.cos(latlng.lat * Math.PI / 180);
+  for (let i = 0; i < coords.length; i++) {
+    const dLat = coords[i][0] - latlng.lat;
+    const dLon = (coords[i][1] - latlng.lng) * cosLat;
+    const d = dLat * dLat + dLon * dLon;
+    if (d < bestD) { bestD = d; best = i; }
+  }
+  return best;
+}
+
+function applyTrim() {
+  state.coords = state.fullCoords.slice(state.trim.i0, state.trim.i1 + 1);
+}
+
+function drawRoad(coords, isReload = true) {
+  if (isReload) {
+    state.fullCoords = coords;
+    state.trim = { i0: 0, i1: coords.length - 1 };
+    applyTrim();
+  }
+
+  // Remove ALL previously drawn road layers
+  roadLayers.forEach(l => map.removeLayer(l));
+  roadLayers.length = 0;
+
+  const full = state.fullCoords;
+  const t = state.trim;
+  const activeLL  = full.slice(t.i0, t.i1 + 1).map(c => [c[0], c[1]]);
+
+  // Full route, dim — shows what's been trimmed away
+  const ghost = L.polyline(full.map(c => [c[0], c[1]]),
+    { color: '#6b7280', weight: 2, opacity: 0.45, dashArray: '4 6' });
+  ghost.addTo(map);
+  roadLayers.push(ghost);
+
+  // Glow layer (wide, dim)
+  const glow = L.polyline(activeLL, { color: '#e8b84b', weight: 10, opacity: 0.12 });
+  glow.addTo(map);
+  roadLayers.push(glow);
+
+  // Main line
+  const line = L.polyline(activeLL, { color: '#e8b84b', weight: 3, opacity: 0.95 });
+  line.addTo(map);
+  roadLayers.push(line);
+
+  // Draggable start/end markers — drag along the road to trim it
+  const makeIcon = (color, label) => L.divIcon({
+    html: `<div style="background:${color};color:#0a0b0d;font-family:'Rajdhani',sans-serif;font-weight:700;font-size:11px;padding:2px 7px;border-radius:3px;white-space:nowrap;box-shadow:0 2px 8px rgba(0,0,0,0.6);cursor:grab;">${label} ⇕</div>`,
+    iconAnchor: [0, 0],
+    className: '',
+  });
+
+  const startMarker = L.marker(activeLL[0],
+    { icon: makeIcon('#4caf7d', 'START'), draggable: true });
+  const endMarker   = L.marker(activeLL[activeLL.length - 1],
+    { icon: makeIcon('#e85555', 'END'), draggable: true });
+
+  startMarker.on('dragend', () => {
+    const i = nearestCoordIndex(startMarker.getLatLng(), full);
+    state.trim.i0 = Math.min(i, state.trim.i1 - 3);
+    applyTrim();
+    drawRoad(full, false);
+    toast(`Start moved — ${state.coords.length} points selected`, 'success', 1800);
+  });
+  endMarker.on('dragend', () => {
+    const i = nearestCoordIndex(endMarker.getLatLng(), full);
+    state.trim.i1 = Math.max(i, state.trim.i0 + 3);
+    applyTrim();
+    drawRoad(full, false);
+    toast(`End moved — ${state.coords.length} points selected`, 'success', 1800);
+  });
+
+  startMarker.addTo(map);
+  endMarker.addTo(map);
+  roadLayers.push(startMarker, endMarker);
+
+  if (isReload) map.fitBounds(line.getBounds(), { padding: [50, 50] });
+}
+
+// ── Elevation chart ────────────────────────────────────────────────────────
+function drawElevChart(profile, stats) {
+  if (!profile || profile.length < 2) return;
+
+  const wrap = document.getElementById('elevChartWrap');
+  const canvas = document.getElementById('elevChart');
+  wrap.style.display = '';
+
+  // Size canvas to its CSS width
+  canvas.width = canvas.offsetWidth || 270;
+  canvas.height = 72;
+  const ctx = canvas.getContext('2d');
+  const W = canvas.width, H = canvas.height;
+
+  const minE = Math.min(...profile);
+  const maxE = Math.max(...profile);
+  const range = maxE - minE || 1;
+  const pad = 4;
+
+  // Gradient fill
+  const grad = ctx.createLinearGradient(0, 0, 0, H);
+  grad.addColorStop(0, 'rgba(232,184,75,0.55)');
+  grad.addColorStop(1, 'rgba(232,184,75,0.03)');
+
+  ctx.clearRect(0, 0, W, H);
+  ctx.beginPath();
+  profile.forEach((e, i) => {
+    const x = (i / (profile.length - 1)) * (W - pad*2) + pad;
+    const y = H - pad - ((e - minE) / range) * (H - pad*2);
+    i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+  });
+  // Close path for fill
+  ctx.lineTo(W - pad, H - pad);
+  ctx.lineTo(pad, H - pad);
+  ctx.closePath();
+  ctx.fillStyle = grad;
+  ctx.fill();
+
+  // Line on top
+  ctx.beginPath();
+  profile.forEach((e, i) => {
+    const x = (i / (profile.length - 1)) * (W - pad*2) + pad;
+    const y = H - pad - ((e - minE) / range) * (H - pad*2);
+    i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+  });
+  ctx.strokeStyle = '#e8b84b';
+  ctx.lineWidth = 1.5;
+  ctx.lineJoin = 'round';
+  ctx.stroke();
+
+  // Min/max labels
+  const rawMin = stats.elev_min_m !== undefined ? stats.elev_min_m : minE;
+  const rawMax = (stats.elev_min_m !== undefined ? stats.elev_min_m : minE) + range;
+  document.getElementById('elevMin').textContent = Math.round(rawMin) + ' m';
+  document.getElementById('elevMax').textContent = Math.round(rawMin + range) + ' m';
+}
+
+function updateStats(s, profile) {
+  document.getElementById('statLength').textContent = s.length_km;
+  document.getElementById('statCorners').textContent = s.corners;
+  document.getElementById('statClimb').textContent =
+    s.has_elevation ? Math.round(s.total_climb_m) : '—';
+  document.getElementById('statRange').textContent =
+    s.has_elevation ? Math.round(s.elev_range_m) : '—';
+  document.getElementById('statsSection').style.display = '';
+
+  if (s.has_elevation && profile && profile.length > 1) {
+    drawElevChart(profile, s);
+  }
+}
+
+// ── Preview ────────────────────────────────────────────────────────────────
+async function doPreview() {
+  if (!state.coords.length) return;
+  setLoading(true);
+  toast('Fetching elevation + building mesh…', 'info', 12000);
+
+  try {
+    const res = await fetch('/api/preview', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        coords: state.coords,
+        road_width: parseFloat(document.getElementById('widthSlider').value),
+        smooth: parseFloat(document.getElementById('smoothSlider').value) / 100,
+      }),
+    });
+    const data = await res.json();
+
+    if (data.error) { toast(data.error, 'error'); return; }
+
+    const s = data.stats;
+    updateStats(s, data.elevation_profile);
+
+    const elevMsg = s.has_elevation
+      ? `↑ ${Math.round(s.total_climb_m)}m climb · ${Math.round(s.elev_range_m)}m range`
+      : 'Elevation data unavailable (API may be down)';
+    toast(`${s.length_km} km · ${s.corners} corners · ${elevMsg}`, 'success', 5000);
+
+  } catch(e) {
+    toast('Preview failed', 'error');
+  } finally {
+    setLoading(false);
+  }
+}
+
+// ── Export ─────────────────────────────────────────────────────────────────
+async function doExport() {
+  if (!state.coords.length || state.processing) return;
+  setLoading(true);
+
+  const trackName = document.getElementById('trackName').value.trim()
+    .replace(/[^a-zA-Z0-9_]/g, '_').slice(0, 32) || 'my_road';
+
+  toast('Fetching elevation + building track mesh…', 'info', 20000);
+
+  try {
+    const res = await fetch('/api/export', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        coords: state.coords,
+        road_width: parseFloat(document.getElementById('widthSlider').value),
+        smooth: parseFloat(document.getElementById('smoothSlider').value) / 100,
+        track_name: trackName,
+        install_path: document.getElementById('acPath').value.trim() || null,
+        include_env: document.getElementById('includeEnv').checked,
+      }),
+    });
+    const data = await res.json();
+
+    if (data.error) { toast(data.error, 'error'); return; }
+
+    const s = data.stats;
+    updateStats(s, data.elevation_profile);
+
+    // Show download
+    const link = document.getElementById('downloadLink');
+    link.href = `/download/${data.filename}`;
+    link.textContent = `⬇ ${data.filename}`;
+    const elevInfo = s.has_elevation
+      ? ` · ↑${Math.round(s.total_climb_m)}m / ↓${Math.round(s.total_descent_m)}m`
+      : ' · flat terrain';
+    const envInfo = (data.buildings || data.trees)
+      ? ` · ${data.buildings} bldgs / ${data.trees} trees`
+      : '';
+    document.getElementById('exportInfo').textContent =
+      `${data.size_kb} KB zip · ${data.kn5_kb} KB kn5 · ready to drive${elevInfo}${envInfo}`;
+    document.getElementById('downloadSection').style.display = '';
+
+    const elevMsg = s.has_elevation ? ` · ↑${Math.round(s.total_climb_m)}m` : '';
+    if (data.installed_to) {
+      toast(`Installed! ${s.length_km} km track ready in AC${elevMsg}`, 'success', 8000);
+      document.getElementById('exportInfo').textContent += ` · INSTALLED → ${data.installed_to}`;
+    } else if (data.install_error) {
+      toast(`Exported, but install failed: ${data.install_error}`, 'error', 8000);
+    } else {
+      toast(`Export ready! ${s.length_km} km track${elevMsg}`, 'success', 5000);
+    }
+
+  } catch(e) {
+    toast('Export failed', 'error');
+  } finally {
+    setLoading(false);
+  }
+}
+
+// ── Sliders ────────────────────────────────────────────────────────────────
+document.getElementById('widthSlider').addEventListener('input', function() {
+  document.getElementById('widthVal').textContent = this.value + ' m';
+});
+document.getElementById('smoothSlider').addEventListener('input', function() {
+  document.getElementById('smoothVal').textContent = this.value + '%';
+});
+
+// ── Search events ──────────────────────────────────────────────────────────
+document.getElementById('searchBtn').addEventListener('click', doSearch);
+document.getElementById('searchInput').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') doSearch();
+});
+
+document.getElementById('previewBtn').addEventListener('click', doPreview);
+document.getElementById('exportBtn').addEventListener('click', doExport);
+</script>
+</body>
+</html>
