@@ -153,20 +153,46 @@ Outside Australia, look for your national mapping agency's open LiDAR programme.
 Any georeferenced elevation GeoTIFF will work, since the tool reads the
 projection from the file itself.
 
-### 3. Drop the files in
+### 3. Create the dem folder
 
-Create a folder called `dem` next to `server.py`, unzip your download, and put
-the `.tif` files inside. Multiple tiles are fine. If they overlap, the finest
-resolution one wins.
+This is the step people miss. The tool does not create this folder for you, and
+if it is not there the tool simply stays in automatic mode without complaining.
+
+Make a folder called exactly `dem`, sitting next to `server.py`:
 
 ```
 your-folder/
   server.py
   index.html
   launch.py
+  dem/          <-- create this yourself
+```
+
+From a terminal in that folder:
+
+```
+mkdir dem
+```
+
+The name is lowercase and the location matters. A `dem` folder inside `output`,
+or one sitting beside the folder rather than inside it, will not be found.
+
+### 4. Add the files
+
+Unzip your download and put the `.tif` files straight into `dem`. There is no
+need to keep any subfolders the zip came with, and you can rename the files to
+whatever you like.
+
+```
+your-folder/
+  server.py
   dem/
     your-lidar-tile.tif
+    another-tile.tif
 ```
+
+Multiple tiles are fine, and the tool loads all of them. If two tiles overlap,
+the finer resolution one wins.
 
 Restart the server. The console confirms what it found:
 
@@ -174,7 +200,7 @@ Restart the server. The console confirms what it found:
 [dem] loaded your-lidar-tile.tif: 8000x8000 px @ 1.0 m/px (EPSG:28354)
 ```
 
-### 4. Confirm it is being used
+### 5. Confirm it is being used
 
 Three things tell you manual mode is active:
 
@@ -189,7 +215,7 @@ If part of your road falls outside the file you get a warning, and that part
 quietly falls back to online data with the vertical datums matched so there is
 no step at the boundary.
 
-### 5. What changes automatically
+### 6. What changes automatically
 
 When LiDAR covers more than 90% of your selected road, the tool reconfigures
 itself, because most of its correction machinery exists to fight errors that no
@@ -341,9 +367,12 @@ line has it too. If it does, the source data is wrong. Try lowering Max Road
 Grade manually, or tick Steady climb if the road genuinely only climbs. LiDAR
 via manual mode fixes this properly.
 
-**Manual mode is not activating.** Confirm rasterio is installed, that the
-folder is named `dem` and sits next to `server.py`, that the files end in `.tif`,
-and that you restarted the server. The console prints what it loaded.
+**Manual mode is not activating.** The most common cause is a missing `dem`
+folder, which you have to create yourself since the tool does not make it. Check
+that it is named `dem` in lowercase, that it sits next to `server.py`, that the
+`.tif` files are directly inside it, that rasterio is installed, and that you
+restarted the server afterwards. The console prints what it loaded on startup,
+so if you see no `[dem]` lines at all it did not find the folder.
 
 **The track will not start in Race mode.** Use Hotlap or Practice. Race needs an
 AI line, which AC generates after one Hotlap run.
