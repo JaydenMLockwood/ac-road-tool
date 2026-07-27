@@ -1,0 +1,23 @@
+# Generated and downloaded data.
+# The folders are kept in the repo via .gitkeep so the layout is intact,
+# but nothing inside them is tracked.
+
+# Caches and exported track packages:
+#   output/tiles/        elevation tiles
+#   output/landcover/    ESA WorldCover chunks
+#   output/geometry/     cached OSM road geometry
+#   output/surroundings/ cached buildings, trees, barriers
+#   output/*.zip         exported tracks
+output/*
+!output/.gitkeep
+
+# LiDAR GeoTIFFs for manual mode. Survey files are hundreds of MB and
+# everyone needs their own area, so these are never committed.
+dem/*
+!dem/.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/

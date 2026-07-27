@@ -6,13 +6,22 @@ OSM road data → elevation → FBX with AC markers → Assetto Corsa track zip
 
 import json, math, os, shutil, struct, time, zipfile, io
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, urlencode
 from urllib.request import urlopen, Request
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 from scipy.interpolate import splprep, splev, interp1d
-from scipy.ndimage import uniform_filter1d, gaussian_filter1d
+from scipy.ndimage import uniform_filter1d, gaussian_filter1d, median_filter
 from pyproj import Transformer
+
+class ElevationUnavailable(Exception):
+    """Elevation or land-cover data could not be obtained.
+
+    Raised rather than silently substituting flat ground: a flat track looks
+    plausible but is wrong, which is worse than a clear failure.
+    """
+
 
 PORT = 8743
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "output")
@@ -47,24 +56,84 @@ def search_osm_roads(query: str) -> dict:
     return {"results": out}
 
 
+OVERPASS_ENDPOINTS = [
+    "https://overpass-api.de/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter",
+    "https://lz4.overpass-api.de/api/interpreter",
+    "https://z.overpass-api.de/api/interpreter",
+    "https://overpass.private.coffee/api/interpreter",
+]
+
+
+_overpass_start = 0     # rotates so we don't always hammer the same mirror
+
+
 def _overpass(q: str, timeout: int = 40):
-    req = Request(
-        "https://overpass-api.de/api/interpreter",
-        data=f"data={q}".encode(),
-        headers={"User-Agent": "AC-Road-Tool/1.0",
-                 "Content-Type": "application/x-www-form-urlencoded"}
-    )
-    with urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read())
+    """
+    Run an Overpass query. Mirrors are tried in a rotating order so repeated
+    queries in one export don't all pile onto the same (usually busiest)
+    instance; several passes with growing backoff ride out the frequent
+    windows where every public mirror is briefly overloaded — 429/504 means
+    "busy", not "broken". Overpass has a second overload mode that is easy
+    to miss: HTTP 200 with a TRUNCATED result and a "remark" saying the
+    query timed out server-side. Accepting that silently produces exports with
+    mysteriously missing barriers/vegetation, so a remark is treated exactly
+    like a busy mirror.
+    """
+    global _overpass_start
+    n = len(OVERPASS_ENDPOINTS)
+    order = [OVERPASS_ENDPOINTS[(_overpass_start + i) % n] for i in range(n)]
+    _overpass_start = (_overpass_start + 1) % n
+
+    last = None
+    waits = (3.0, 8.0, 15.0)
+    for attempt in range(len(waits) + 1):
+        for url in order:
+            try:
+                req = Request(
+                    url,
+                    data=urlencode({"data": q}).encode(),
+                    headers={"User-Agent": "AC-Road-Tool/1.0",
+                             "Content-Type": "application/x-www-form-urlencoded"}
+                )
+                with urlopen(req, timeout=timeout) as r:
+                    data = json.loads(r.read())
+                remark = str(data.get("remark", "")).lower()
+                if remark and any(w in remark for w in
+                                  ("timed out", "timeout", "error",
+                                   "out of memory", "load")):
+                    raise IOError(f"partial result: {remark[:70]}")
+                return data
+            except Exception as e:
+                last = e
+                busy = any(c in str(e) for c in
+                           ("429", "504", "503", "partial result"))
+                print(f"  [overpass] {url.split('/')[2]} "
+                      f"{'busy' if busy else 'failed'} ({e}) — next mirror")
+        if attempt < len(waits):
+            print(f"  [overpass] all mirrors busy — waiting "
+                  f"{waits[attempt]:.0f}s and retrying "
+                  f"({attempt + 1}/{len(waits)})")
+            time.sleep(waits[attempt])
+    raise IOError(f"all Overpass mirrors failed (last: {last})")
 
 
 def _stitch_segments(segments: list, seed_idx: int = None,
-                     tol_m: float = 40.0) -> tuple:
+                     tol_m: float = 40.0, far_tol_m: float = 300.0) -> tuple:
     """
     Chain road segments (lists of [lat,lon]) into one continuous route by
-    matching endpoints. Greedy: start from the seed (or longest) segment,
+    matching endpoints. Greedy: start from the seed (or longest) segment and
     repeatedly attach the nearest-endpoint segment to either end, reversing
-    as needed, until no segment connects within tol_m.
+    as needed.
+
+    Two acceptance bands, because stopping at the first gap silently truncates
+    the road — a single roundabout or offset junction node used to drop
+    everything beyond it:
+      • within tol_m  — treat as a genuine topological join, accept as-is.
+      • up to far_tol_m — a junction-sized gap; accept ONLY if the candidate
+        carries on in roughly the same direction. That guard is what stops the
+        chain hopping onto the opposite carriageway of a divided road and
+        zig-zagging back down it.
     Returns (coords, used_count).
     """
     if not segments:
@@ -83,6 +152,23 @@ def _stitch_segments(segments: list, seed_idx: int = None,
     chain = segs.pop(seed_idx)
     used = 1
 
+    def heading(pts, at_end):
+        """Unit direction pointing OUT of the chain/segment at one end."""
+        if len(pts) < 2:
+            return (0.0, 0.0)
+        if at_end:
+            a, b = pts[max(0, len(pts) - 4)], pts[-1]
+        else:
+            a, b = pts[min(len(pts) - 1, 3)], pts[0]
+        dy, dx = b[0] - a[0], (b[1] - a[1]) * math.cos(math.radians(b[0]))
+        n = math.hypot(dx, dy) or 1.0
+        return (dx / n, dy / n)
+
+    def continues(chain_dir, cand_dir):
+        # reject a candidate that doubles back (opposite carriageway)
+        return (chain_dir[0] * cand_dir[0] + chain_dir[1] * cand_dir[1]) > -0.34
+
+    bridged = 0
     while segs:
         head, tail = chain[0], chain[-1]
         best = None   # (dist, seg_i, attach_at, reverse)
@@ -93,12 +179,28 @@ def _stitch_segments(segments: list, seed_idx: int = None,
                     d = _haversine(cpt[0], cpt[1], spt[0], spt[1])
                     if best is None or d < best[0]:
                         best = (d, i, attach_at, rev)
-        if best is None or best[0] > tol_m:
+        if best is None or best[0] > far_tol_m:
             break
+
         _, i, attach_at, rev = best
-        s = segs.pop(i)
-        if rev:
-            s = list(reversed(s))
+        s = segs[i]
+        cand = list(reversed(s)) if rev else s
+
+        if best[0] > tol_m:
+            # junction-sized gap: only bridge it if the road carries on
+            c_dir = heading(chain, attach_at == "tail")
+            n_dir = heading(cand, attach_at != "tail")
+            if attach_at == "tail":
+                n_dir = heading(cand, False)
+                n_dir = (-n_dir[0], -n_dir[1])
+            if not continues(c_dir, n_dir):
+                # not a continuation — drop it so the search can move on
+                segs.pop(i)
+                continue
+            bridged += 1
+
+        segs.pop(i)
+        s = cand
         if attach_at == "tail":
             # drop duplicated joint point if coincident
             if _haversine(chain[-1][0], chain[-1][1], s[0][0], s[0][1]) < 1.0:
@@ -110,7 +212,59 @@ def _stitch_segments(segments: list, seed_idx: int = None,
             chain = s + chain
         used += 1
 
+    if bridged:
+        print(f"  [geometry] bridged {bridged} junction-sized gap(s)")
     return chain, used
+
+
+def _struct_flag(tags: dict) -> int:
+    """1 if a way is carried on a structure the DEM cannot see.
+
+    Elevation data measures the GROUND SURFACE, not the road. Bridges and
+    tunnels are the obvious cases, but embankments and cuttings lie the same
+    way: an embankment carries the road level across a gully the DEM dives
+    into, and a cutting carries it below a ridge the DEM climbs over. All are
+    levelled with a straight grade between the ground heights at their ends.
+    """
+    for key in ("bridge", "tunnel", "embankment", "cutting"):
+        v = str(tags.get(key, "no")).strip().lower()
+        if v and v not in ("no", "false", "0"):
+            return 1
+    if str(tags.get("covered", "no")).lower() in ("yes", "true"):
+        return 1
+    return 0
+
+
+_GEOM_CACHE_DIR = os.path.join(OUTPUT_DIR, "geometry")
+_GEOM_CACHE_VER = 2      # bump when _struct_flag or stitching logic changes
+_geom_mem = {}
+
+
+def _geom_cached(osm_type, osm_id):
+    key = f"{osm_type}_{osm_id}_v{_GEOM_CACHE_VER}"
+    if key in _geom_mem:
+        return _geom_mem[key]
+    path = os.path.join(_GEOM_CACHE_DIR, f"{key}.json")
+    if os.path.exists(path):
+        try:
+            with open(path) as f:
+                data = json.load(f)
+            _geom_mem[key] = data
+            return data
+        except Exception:
+            pass
+    return None
+
+
+def _geom_store(osm_type, osm_id, data):
+    key = f"{osm_type}_{osm_id}_v{_GEOM_CACHE_VER}"
+    _geom_mem[key] = data
+    try:
+        os.makedirs(_GEOM_CACHE_DIR, exist_ok=True)
+        with open(os.path.join(_GEOM_CACHE_DIR, f"{key}.json"), 'w') as f:
+            json.dump(data, f)
+    except Exception:
+        pass
 
 
 def fetch_road_geometry(osm_type: str, osm_id: str) -> dict:
@@ -120,6 +274,12 @@ def fetch_road_geometry(osm_type: str, osm_id: str) -> dict:
     same-named ways in the surrounding area, and stitch them into one
     continuous route.
     """
+    hit = _geom_cached(osm_type, osm_id)
+    if hit is not None:
+        print(f"  [geometry] cached: {hit.get('count', 0)} points "
+              f"({hit.get('segments_used')}/{hit.get('segments_total')} segments)")
+        return hit
+
     try:
         if osm_type == "way":
             data = _overpass(f"[out:json];way({osm_id});out geom;")
@@ -135,7 +295,8 @@ def fetch_road_geometry(osm_type: str, osm_id: str) -> dict:
     if not elements:
         return {"error": "No geometry found", "coords": []}
 
-    segments = [[[g["lat"], g["lon"]] for g in el["geometry"]]
+    segments = [[[g["lat"], g["lon"], _struct_flag(el.get("tags", {}))]
+                 for g in el["geometry"]]
                 for el in elements]
     seed_idx = 0
 
@@ -161,7 +322,9 @@ def fetch_road_geometry(osm_type: str, osm_id: str) -> dict:
                             if el.get("type") == "way" and "geometry" in el]
                 if len(more_els) > len(elements):
                     seed_geom = segments[0]
-                    segments = [[[g["lat"], g["lon"]] for g in el["geometry"]]
+                    segments = [[[g["lat"], g["lon"],
+                                  _struct_flag(el.get("tags", {}))]
+                                 for g in el["geometry"]]
                                 for el in more_els]
                     # seed = the originally selected way (match by first point)
                     seed_idx = 0
@@ -180,8 +343,10 @@ def fetch_road_geometry(osm_type: str, osm_id: str) -> dict:
         return {"error": "No geometry found", "coords": []}
     print(f"  [geometry] stitched {used}/{len(segments)} segments, "
           f"{len(coords)} points")
-    return {"coords": coords, "count": len(coords),
-            "segments_used": used, "segments_total": len(segments)}
+    out = {"coords": coords, "count": len(coords),
+           "segments_used": used, "segments_total": len(segments)}
+    _geom_store(osm_type, osm_id, out)
+    return out
 
 
 def _haversine(lat1, lon1, lat2, lon2):
@@ -200,9 +365,29 @@ def fetch_surroundings(coords: list, radius_m: float = 60.0) -> dict:
     Returns {"buildings": [{"outline": [[lat,lon],...], "height": m}],
              "trees": [[lat, lon], ...]}  (empty lists on failure).
     """
-    out = {"buildings": [], "trees": [], "forests": []}
+    out = {"buildings": [], "trees": [], "forests": [], "roads": [],
+           "waterways": [], "barriers": []}
     if len(coords) < 2:
         return out
+
+    # Cache per road selection: re-exporting the same section (the natural
+    # reaction to a busy-Overpass failure) must not refetch anything.
+    import hashlib
+    h = hashlib.md5(f"v3|{radius_m:.0f}|{len(coords)}".encode())
+    for c in coords[::max(1, len(coords) // 500)]:
+        h.update(f"{c[0]:.5f},{c[1]:.5f};".encode())
+    cache_path = os.path.join(OUTPUT_DIR, "surroundings", h.hexdigest() + ".json")
+    if os.path.exists(cache_path):
+        try:
+            with open(cache_path) as f:
+                cached = json.load(f)
+            print(f"  [surroundings] cache hit "
+                  f"({len(cached.get('buildings', []))} buildings, "
+                  f"{len(cached.get('barriers', []))} barriers)")
+            return cached
+        except Exception:
+            pass
+    complete = True
 
     # Overpass 'around' accepts a polyline — downsample to ≤120 points
     step = max(1, len(coords) // 120)
@@ -213,6 +398,11 @@ def fetch_surroundings(coords: list, radius_m: float = 60.0) -> dict:
 
     q = (f"[out:json][timeout:40];"
          f"(way[\"building\"](around:{radius_m:.0f},{line});"
+         f"way[\"highway\"](around:{radius_m:.0f},{line});"
+         f"way[\"waterway\"~\"river|stream|canal|drain|ditch\"]"
+         f"(around:{radius_m:.0f},{line});"
+         f"way[\"barrier\"~\"fence|wall|hedge|guard_rail|retaining_wall\"]"
+         f"(around:{radius_m:.0f},{line});"
          f"node[\"natural\"=\"tree\"](around:{radius_m:.0f},{line});"
          f"way[\"natural\"=\"tree_row\"](around:{radius_m:.0f},{line});"
          f"way[\"natural\"~\"wood|scrub|heath\"](around:{radius_m:.0f},{line});"
@@ -227,8 +417,11 @@ def fetch_surroundings(coords: list, radius_m: float = 60.0) -> dict:
     try:
         data = _overpass(q, timeout=50)
     except Exception as e:
-        print(f"  [surroundings] Overpass failed: {e}")
-        return out
+        # A silently barren track looks like a bug ("where are my barriers?")
+        # — a clear retryable failure is more honest.
+        raise IOError("OpenStreetMap (Overpass) servers are busy — "
+                      "surroundings could not be fetched. Wait a minute and "
+                      f"export again. ({e})")
 
     def veg_density(tags):
         """1.0 = dense woodland, lower = sparser scatter."""
@@ -264,6 +457,25 @@ def fetch_surroundings(coords: list, radius_m: float = 60.0) -> dict:
                     h = max(2.5, min(h, 60.0))
                     if len(outline) >= 3:
                         out["buildings"].append({"outline": outline, "height": h})
+                elif "highway" in tags:
+                    # Adjacent roads — the arnis approach: render every
+                    # highway the query returns, draped on the terrain.
+                    # Foot-scale ways are skipped; they read as noise at
+                    # driving speed.
+                    htype = tags["highway"]
+                    if htype in ("footway", "path", "steps", "pedestrian",
+                                 "cycleway", "bridleway", "corridor"):
+                        pass
+                    elif len(outline) >= 2:
+                        out["roads"].append({"pts": outline, "type": htype})
+                elif "waterway" in tags:
+                    if len(outline) >= 2:
+                        out["waterways"].append({"pts": outline,
+                                                 "type": tags["waterway"]})
+                elif "barrier" in tags:
+                    if len(outline) >= 2:
+                        out["barriers"].append({"pts": outline,
+                                                "type": tags["barrier"]})
                 elif tags.get("natural") == "tree_row":
                     # plant a tree every ~8m along the row
                     for j in range(len(outline) - 1):
@@ -324,17 +536,115 @@ def fetch_surroundings(coords: list, radius_m: float = 60.0) -> dict:
         data2 = _overpass(q2, timeout=40)
         parse_elements(data2.get("elements", []))
     except Exception as e:
+        complete = False              # usable but partial: don't cache it
         print(f"  [surroundings] containment query failed: {e}")
 
     # Caps to keep the KN5 sane
     out["buildings"] = out["buildings"][:800]
     out["trees"]     = out["trees"][:1500]
     out["forests"]   = out["forests"][:300]
+    out["roads"]     = out["roads"][:400]
+    out["waterways"] = out["waterways"][:200]
+    out["barriers"]  = out["barriers"][:300]
     dens = [f["density"] for f in out["forests"]]
     print(f"  [surroundings] {len(out['buildings'])} buildings, "
-          f"{len(out['trees'])} tree nodes, {len(out['forests'])} vegetation "
+          f"{len(out['trees'])} tree nodes, {len(out['roads'])} nearby roads, "
+          f"{len(out['waterways'])} waterways, {len(out['barriers'])} barriers, "
+          f"{len(out['forests'])} vegetation "
           f"areas (max density {max(dens) if dens else 0})")
+    if complete:
+        try:
+            os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+            with open(cache_path, "w") as f:
+                json.dump(out, f)
+        except Exception:
+            pass
     return out
+
+
+def _gable_frame(pts: list):
+    """
+    Oriented frame for a roughly rectangular footprint: centre, unit axes
+    (u along the long side), and half-extents. Returns None when the
+    footprint isn't rectangular enough for a clean gable (polygon area under
+    82% of its oriented bounding box — an L-shape with a modest wing sits
+    around 75%) — those keep a flat roof.
+    """
+    P = np.array(pts, dtype=float)
+    n = len(P)
+    e = P[(np.arange(n) + 1) % n] - P
+    L = np.hypot(e[:, 0], e[:, 1])
+    k = int(np.argmax(L))
+    if L[k] < 1e-6:
+        return None
+    ux, uz = e[k] / L[k]
+    area = abs(sum(P[i, 0] * P[(i+1) % n, 1] - P[(i+1) % n, 0] * P[i, 1]
+                   for i in range(n))) / 2.0
+    a = P @ np.array([ux, uz])
+    b = P @ np.array([-uz, ux])
+    hl = (a.max() - a.min()) / 2.0
+    hw = (b.max() - b.min()) / 2.0
+    if hl < 1e-6 or hw < 1e-6 or area < 0.82 * (4.0 * hl * hw):
+        return None
+    if hw > hl:                            # ridge always along the long axis
+        ux, uz, hl, hw = -uz, ux, hw, hl
+        a, b = P @ np.array([ux, uz]), P @ np.array([-uz, ux])
+        hl = (a.max() - a.min()) / 2.0
+        hw = (b.max() - b.min()) / 2.0
+    cx = (a.max() + a.min()) / 2.0 * ux + (b.max() + b.min()) / 2.0 * -uz
+    cz = (a.max() + a.min()) / 2.0 * uz + (b.max() + b.min()) / 2.0 * ux
+    return {"cx": cx, "cz": cz, "ux": ux, "uz": uz, "hl": hl, "hw": hw}
+
+
+def _ear_clip(pts: list) -> list:
+    """
+    Triangulate a simple polygon [(x, z), ...] by ear clipping. A triangle
+    fan — the previous approach — folds over itself on any concave footprint
+    (L-shaped houses, courtyards), which made most roofs look broken.
+    Returns [(i, j, k), ...] index triples; falls back to a fan if the
+    outline is degenerate/self-intersecting.
+    """
+    n = len(pts)
+    if n < 3:
+        return []
+
+    def cross(o, a, b):
+        return (a[0]-o[0])*(b[1]-o[1]) - (a[1]-o[1])*(b[0]-o[0])
+
+    area = sum(pts[i][0]*pts[(i+1) % n][1] - pts[(i+1) % n][0]*pts[i][1]
+               for i in range(n))
+    idx = list(range(n))
+    if area < 0:
+        idx.reverse()
+
+    def in_tri(p, a, b, c):
+        return (cross(a, b, p) >= -1e-9 and cross(b, c, p) >= -1e-9
+                and cross(c, a, p) >= -1e-9)
+
+    tris = []
+    guard = 0
+    while len(idx) > 3 and guard < 10 * n:
+        guard += 1
+        clipped = False
+        for ii in range(len(idx)):
+            i0, i1, i2 = idx[ii-1], idx[ii], idx[(ii+1) % len(idx)]
+            a, b, c = pts[i0], pts[i1], pts[i2]
+            if cross(a, b, c) <= 1e-12:
+                continue                       # reflex or collinear corner
+            if any(in_tri(pts[j], a, b, c)
+                   for j in idx if j not in (i0, i1, i2)):
+                continue                       # another vertex inside: not an ear
+            tris.append((i0, i1, i2))
+            idx.pop(ii)
+            clipped = True
+            break
+        if not clipped:
+            break
+    if len(idx) == 3:
+        tris.append((idx[0], idx[1], idx[2]))
+    elif not tris:
+        tris = [(0, i, i+1) for i in range(1, n-1)]   # degenerate: fan fallback
+    return tris
 
 
 def build_environment_meshes(surroundings: dict, mesh: dict,
@@ -358,6 +668,7 @@ def build_environment_meshes(surroundings: dict, mesh: dict,
     from scipy.spatial import cKDTree
     cl = mesh["centerline"]
     hw = mesh["stats"]["road_width"] / 2.0
+    kd_road = cKDTree(np.array([[p[0], p[2]] for p in cl]))
     if ground_pts:
         g_xz = np.array([[p[0], p[2]] for p in ground_pts])
         g_y  = np.array([p[1] for p in ground_pts])
@@ -366,6 +677,23 @@ def build_environment_meshes(surroundings: dict, mesh: dict,
         def ground_y(x, z):
             _, i = kd.query([x, z])
             return float(g_y[i])
+
+        def ground_y_smooth(x, z):
+            # Inverse-distance blend of the 4 nearest ground vertices: the
+            # terrain grid is 12m, so nearest-vertex heights step visibly
+            # along a draped strip; blending removes the stair-stepping.
+            d, i = kd.query([x, z], k=4)
+            w = 1.0 / (np.asarray(d) + 0.5)
+            return float(np.sum(g_y[np.asarray(i)] * w) / np.sum(w))
+
+        def ground_max(x, z):
+            # Highest of the 4 nearest terrain vertices. A triangle surface
+            # can never rise above its corner heights, so a strip vertex at
+            # this height (+ lift) is GUARANTEED above the rendered terrain —
+            # the IDW average undershoots on slopes and lets grass poke
+            # through draped roads.
+            _, i = kd.query([x, z], k=4)
+            return float(np.max(g_y[np.asarray(i)]))
     else:
         cl_xz = np.array([[p[0], p[2]] for p in cl])
         cl_y  = np.array([p[1] for p in cl])
@@ -374,6 +702,9 @@ def build_environment_meshes(surroundings: dict, mesh: dict,
         def ground_y(x, z):
             d, i = kd.query([x, z])
             return float(cl_y[i]) - ground_drop(float(d) - hw)
+
+        ground_y_smooth = ground_y
+        ground_max = ground_y
 
     def to_local(lat, lon):
         X, Z = proj.transform(lon, lat)
@@ -406,7 +737,12 @@ def build_environment_meshes(surroundings: dict, mesh: dict,
             j = i
         return inside
 
-    if forests and len(tree_pts) < 1500:
+    lc_fn = mesh.get("land_cover")
+    lc_latlon = mesh.get("to_latlon")
+    if lc_latlon is None:
+        lc_fn = None
+
+    if (forests or lc_fn) and len(tree_pts) < 1500:
         rng = np.random.default_rng(99)
         min_lat = hw + 4.0          # keep off road and verge
         max_lat = hw + GRASS_W + SKIRT_W - 3.0
@@ -425,37 +761,77 @@ def build_environment_meshes(surroundings: dict, mesh: dict,
                     along = rng.uniform(-6, 6)
                     x = p[0] + side * px_ * lat_d + dx / L * along
                     z = p[2] + side * pz_ * lat_d + dz / L * along
+                    placed = False
                     for poly, bb, density in forests:
                         if bb[0] <= x <= bb[2] and bb[1] <= z <= bb[3] \
                            and rng.random() < density \
                            and in_poly(x, z, poly):
                             tree_pts.append((x, z))
+                            placed = True
                             break
+                    # No OSM polygon here — ask WorldCover what the ground
+                    # actually is. This is what fills in rural roads that
+                    # nobody has mapped vegetation for.
+                    if not placed and lc_fn is not None:
+                        la, lo = lc_latlon(x, z)
+                        dns = LC_TREE_DENSITY.get(lc_fn(la, lo), 0.0)
+                        if dns > 0 and rng.random() < dns:
+                            tree_pts.append((x, z))
+
+    # ── Road clearance ──
+    # Nothing may stand on the carriageway: OSM tree nodes are often mapped
+    # a few metres off, road smoothing shifts the road from its GPS line, and
+    # the scatter's along-road jitter can curl into the road on bends. Every
+    # tree is checked against its true distance to the centreline.
+    if tree_pts:
+        d_road, _ = kd_road.query(np.array(tree_pts))
+        before = len(tree_pts)
+        tree_pts = [t for t, dd in zip(tree_pts, d_road) if dd > hw + 2.0]
+        if len(tree_pts) < before:
+            print(f"  [surroundings] removed {before - len(tree_pts)} tree(s) "
+                  f"standing on/beside the carriageway")
 
     meshes = []
 
-    # ── Buildings: extruded footprints ──
-    verts, idx = [], []
-    part = 0
+    # ── Buildings: extruded footprints, alternating two wall materials ──
+    bld = {"building": [[], [], 0], "building2": [[], [], 0]}
+    roof_verts, roof_idx = [], []
+    roof_part = 0
 
-    def flush_buildings():
-        nonlocal verts, idx, part
-        if verts:
-            meshes.append((f"ENV_BLDG_{part}", verts, idx, "building"))
-            part += 1
-            verts, idx = [], []
+    def flush_building(mat):
+        verts_w, idx_w, part_w = bld[mat]
+        if verts_w:
+            suffix = "" if mat == "building" else "B"
+            meshes.append((f"ENV_BLDG{suffix}_{part_w}", verts_w, idx_w, mat))
+            bld[mat] = [[], [], part_w + 1]
 
-    for b in surroundings.get("buildings", []):
+    def flush_roofs():
+        nonlocal roof_verts, roof_idx, roof_part
+        if roof_verts:
+            meshes.append((f"ENV_ROOF_{roof_part}", roof_verts, roof_idx, "roof"))
+            roof_part += 1
+            roof_verts, roof_idx = [], []
+
+    for bi, b in enumerate(surroundings.get("buildings", [])):
+        wall_mat = "building" if bi % 2 == 0 else "building2"
+        verts, idx, _ = bld[wall_mat]
         pts = [to_local(la, lo) for la, lo in b["outline"]]
         if len(pts) > 2 and pts[0] == pts[-1]:
             pts = pts[:-1]
         if len(pts) < 3 or len(pts) > 60:
             continue
+        # Footprint crossing the carriageway = bad mapping or road smoothing
+        # cutting through it; either way a building on the track is worse
+        # than no building.
+        d_b, _ = kd_road.query(np.array(pts))
+        if float(d_b.min()) < hw:
+            continue
         base = min(ground_y(x, z) for x, z in pts) - 0.5
         top  = base + 0.5 + b["height"]
 
         if len(verts) + len(pts)*5 > 60000:
-            flush_buildings()
+            flush_building(wall_mat)
+            verts, idx, _ = bld[wall_mat]
         # Walls: quad per edge, double-sided (interior winding unknown)
         for i in range(len(pts)):
             x0, z0 = pts[i]
@@ -472,55 +848,427 @@ def build_environment_meshes(surroundings: dict, mesh: dict,
             idx.extend((v, v+1, v+2,  v, v+2, v+3))
             idx.extend((v, v+2, v+1,  v, v+3, v+2))
 
-        # Roof: triangle fan (fine for mostly-convex footprints), double-sided
-        r0 = len(verts)
-        for x, z in pts:
-            verts.append(((x, top, z), (0, 1, 0), (x*0.1, z*0.1), (1, 0, 0)))
-        for i in range(1, len(pts)-1):
-            idx.extend((r0, r0+i, r0+i+1))
-            idx.extend((r0, r0+i+1, r0+i))
-    flush_buildings()
+        # Roof. Flat extrusions read as industrial sheds; most buildings near
+        # a road are HOUSES, so rectangular-ish low footprints get a proper
+        # gable roof (two pitched planes + triangular gable ends), with a
+        # small eave overhang. Complex or tall footprints keep the flat roof.
+        frame = _gable_frame(pts) if (b["height"] <= 8.0 and len(pts) <= 8) else None
+        if frame is not None and frame["hw"] > 1.5:
+            fx, fz = frame["cx"], frame["cz"]
+            ux_, uz_ = frame["ux"], frame["uz"]
+            vx_, vz_ = -uz_, ux_
+            hl_, hw_ = frame["hl"], frame["hw"]
+            ov = 0.35                                     # eave overhang
+            rise = 0.45 * hw_                             # ~24° pitch
+            ridge_y = top + rise
 
-    # ── Trees: 4-sided trunk + pyramid canopy, double-sided ──
-    verts, idx = [], []
-    part = 0
+            def fp(au, av, y):                            # frame point
+                return (fx + ux_*au + vx_*av, y, fz + uz_*au + vz_*av)
 
-    def flush_trees():
-        nonlocal verts, idx, part
-        if verts:
-            meshes.append((f"ENV_TREE_{part}", verts, idx, "tree"))
-            part += 1
-            verts, idx = [], []
+            if len(roof_verts) + 8 > 60000:
+                flush_roofs()
+            for sv in (+1, -1):                           # two pitched planes
+                r0 = len(roof_verts)
+                # slanted plane normal
+                nl = math.hypot(rise, hw_ + ov) or 1.0
+                nx_r, ny_r, nz_r = (sv*vx_*rise/nl, (hw_+ov)/nl, sv*vz_*rise/nl)
+                corners = [fp(-hl_-ov, sv*(hw_+ov), top),
+                           fp(+hl_+ov, sv*(hw_+ov), top),
+                           fp(+hl_+ov, 0.0, ridge_y),
+                           fp(-hl_-ov, 0.0, ridge_y)]
+                uvs_r = [(0, 0), ((hl_+ov)*0.3, 0),
+                         ((hl_+ov)*0.3, 1), (0, 1)]
+                for c_, uv_ in zip(corners, uvs_r):
+                    roof_verts.append((c_, (nx_r, ny_r, nz_r), uv_, (ux_, 0, uz_)))
+                roof_idx.extend((r0, r0+1, r0+2,  r0, r0+2, r0+3))
+                roof_idx.extend((r0, r0+2, r0+1,  r0, r0+3, r0+2))
+            # gable end triangles (wall material, at the footprint ends)
+            for su in (+1, -1):
+                g0 = len(verts)
+                gnx, gnz = su*ux_, su*uz_
+                verts.append((fp(su*hl_, +hw_, top), (gnx, 0, gnz), (0, 0), (vx_, 0, vz_)))
+                verts.append((fp(su*hl_, -hw_, top), (gnx, 0, gnz), (hw_*0.5, 0), (vx_, 0, vz_)))
+                verts.append((fp(su*hl_, 0.0, ridge_y), (gnx, 0, gnz), (hw_*0.25, 0.6), (vx_, 0, vz_)))
+                idx.extend((g0, g0+1, g0+2))
+                idx.extend((g0, g0+2, g0+1))
+        else:
+            # Flat roof: proper triangulation (a fan folds over itself on
+            # concave footprints), double-sided, own material.
+            if len(roof_verts) + len(pts) > 60000:
+                flush_roofs()
+            r0 = len(roof_verts)
+            for x, z in pts:
+                roof_verts.append(((x, top, z), (0, 1, 0), (x*0.1, z*0.1), (1, 0, 0)))
+            for i0, i1, i2 in _ear_clip(pts):
+                roof_idx.extend((r0+i0, r0+i1, r0+i2))
+                roof_idx.extend((r0+i0, r0+i2, r0+i1))
+    flush_building("building")
+    flush_building("building2")
+    flush_roofs()
+
+    # ── Draped linear features: adjacent roads, waterways, barriers ──
+    # (the arnis approach: render every linear feature the query returns.)
+    # All visual-only — no digit prefix → no physics, so none of these can
+    # reintroduce collision spikes.
+    SIDE_ROAD_W = {"motorway": 11.0, "trunk": 10.0, "primary": 8.0,
+                   "secondary": 7.0, "tertiary": 6.5, "residential": 5.5,
+                   "unclassified": 5.5, "living_street": 5.0, "service": 4.0,
+                   "track": 3.0}
+    WATER_W   = {"river": 8.0, "canal": 6.0, "stream": 2.5,
+                 "drain": 1.5, "ditch": 1.2}
+    BARRIER_H = {"fence": 1.2, "wall": 1.8, "hedge": 1.5,
+                 "guard_rail": 0.75, "retaining_wall": 2.0}
+    BARRIER_MAT = {"hedge": "tree", "guard_rail": "asphalt"}  # others: building
+
+    def _clip_runs(pts_ll, clip_dist, step=4.0):
+        """Resample a lat/lon polyline every `step` m in local space and split
+        it into runs clear of the drivable road. Yields
+        (xs, zs, ts, prev_pt, next_pt) — prev/next are the first clipped
+        neighbour position when the run was truncated BY the road (i.e. at a
+        junction), else None."""
+        loc = np.array([to_local(la, lo) for la, lo in pts_ll])
+        if len(loc) < 2:
+            return
+        seg = np.sqrt(((loc[1:] - loc[:-1]) ** 2).sum(axis=1))
+        arc = np.concatenate([[0.0], np.cumsum(seg)])
+        if arc[-1] < 6.0:
+            return
+        t = np.arange(0.0, arc[-1] + step / 2, step)
+        sx = np.interp(t, arc, loc[:, 0])
+        sz = np.interp(t, arc, loc[:, 1])
+        d_cl, _ = kd_road.query(np.column_stack([sx, sz]))
+        keep = d_cl > clip_dist
+        i = 0
+        n = len(sx)
+        while i < n:
+            if not keep[i]:
+                i += 1
+                continue
+            j = i
+            while j < n and keep[j]:
+                j += 1
+            if j - i >= 2:
+                prev_pt = (float(sx[i-1]), float(sz[i-1])) if i > 0 else None
+                next_pt = (float(sx[j]),   float(sz[j]))   if j < n else None
+                yield (sx[i:j], sz[i:j], t[i:j], prev_pt, next_pt)
+            i = j
+
+    def _extend_to_road(x0, z0, xn, zn, target):
+        """Walk from a run endpoint toward its clipped neighbour until the
+        distance to the road centreline falls to `target` (just inside the
+        road edge), so the strip meets the carriageway with no gap."""
+        vx, vz = xn - x0, zn - z0
+        lo, hi = 0.0, 1.5                    # overshoot past the neighbour ok
+        for _ in range(12):
+            mid = (lo + hi) / 2.0
+            d, _i = kd_road.query([x0 + vx * mid, z0 + vz * mid])
+            if d > target:
+                lo = mid
+            else:
+                hi = mid
+        px2, pz2 = x0 + vx * hi, z0 + vz * hi
+        d, _i = kd_road.query([px2, pz2])
+        return (float(px2), float(pz2)) if d <= target + 0.6 else None
+
+    def _emit_flat(pts3, half_w, lift, verts, idx):
+        """Emit a draped strip from [(x, z, ext_y_or_None, u), ...].
+
+        Heights are computed PER EDGE VERTEX from ground_max — the highest of
+        the local terrain corners, which the terrain surface can never exceed
+        — so the strip cannot be poked through by grass on slopes (the old
+        IDW-average heights undershot the triangle surface between vertices).
+        The floor heights are then gaussian-smoothed along the run so the
+        strip drives/reads like a graded road rather than stair-stepping,
+        with the smooth clamped to never dip back below the floor. The strip
+        also banks with the terrain, since each edge carries its own height.
+        Junction-extension rows (ext_y set) keep their tucked height so they
+        stay under the main road's edge.
+        """
+        n = len(pts3)
+        axs = np.array([p[0] for p in pts3])
+        azs = np.array([p[1] for p in pts3])
+        dxs_ = np.gradient(axs); dzs_ = np.gradient(azs)
+        L = np.sqrt(dxs_**2 + dzs_**2) + 1e-9
+        px_, pz_ = -dzs_ / L, dxs_ / L
+        hs = {}
+        for side in (+1, -1):
+            floor = np.array([ground_max(axs[k] + side*px_[k]*half_w,
+                                         azs[k] + side*pz_[k]*half_w) + lift
+                              for k in range(n)])
+            h = np.maximum(gaussian_filter1d(floor, sigma=1.5), floor) \
+                if n >= 3 else floor
+            for k, p in enumerate(pts3):
+                if p[2] is not None:          # junction extension: tuck
+                    h[k] = p[2]
+            hs[side] = h
+        v0 = len(verts)
+        for k, (x_, z_, _e, u_) in enumerate(pts3):
+            for side in (+1, -1):
+                verts.append(((x_ + side*px_[k]*half_w, float(hs[side][k]),
+                               z_ + side*pz_[k]*half_w),
+                              (0.0, 1.0, 0.0),
+                              (0.0 if side > 0 else 1.0, u_ * 0.1),
+                              (1.0, 0.0, 0.0)))
+        for k in range(n - 1):
+            a = v0 + k*2
+            idx.extend((a, a+3, a+1,  a, a+2, a+3))
+            idx.extend((a, a+1, a+3,  a, a+3, a+2))
+        return n - 1
+
+    # — Adjacent roads: blend seamlessly into the drivable road. Each run
+    #   truncated at a junction gets an extra endpoint pushed to just INSIDE
+    #   the road edge and tucked slightly below the road surface, so the side
+    #   road visually runs under the carriageway edge with no gap and no lip.
+    side_verts, side_idx = [], []
+    s_part = 0
+
+    def flush_side():
+        nonlocal side_verts, side_idx, s_part
+        if side_verts:
+            meshes.append((f"ENV_SIDEROAD_{s_part}", side_verts, side_idx,
+                           "asphalt"))
+            s_part += 1
+            side_verts, side_idx = [], []
+
+    def _draped_runs(pts_ll, clip_dist, ext_target, tuck):
+        """Runs as [(x, z, ext_y_or_None, u), ...]: heights are left to the
+        emitter except junction extensions, which carry their tucked height
+        (just under the main road's edge)."""
+        for rx_, rz_, rt_, prev_pt, next_pt in _clip_runs(pts_ll, clip_dist):
+            pts3 = []
+            if prev_pt is not None and ext_target is not None:
+                e = _extend_to_road(float(rx_[0]), float(rz_[0]),
+                                    prev_pt[0], prev_pt[1], ext_target)
+                if e:
+                    pts3.append((e[0], e[1],
+                                 ground_y_smooth(e[0], e[1]) - tuck,
+                                 float(rt_[0]) - 4.0))
+            for k in range(len(rx_)):
+                pts3.append((float(rx_[k]), float(rz_[k]), None,
+                             float(rt_[k])))
+            if next_pt is not None and ext_target is not None:
+                e = _extend_to_road(float(rx_[-1]), float(rz_[-1]),
+                                    next_pt[0], next_pt[1], ext_target)
+                if e:
+                    pts3.append((e[0], e[1],
+                                 ground_y_smooth(e[0], e[1]) - tuck,
+                                 float(rt_[-1]) + 4.0))
+            if len(pts3) >= 2:
+                yield pts3
+
+    n_side = 0
+    for rd in surroundings.get("roads", []):
+        w2 = SIDE_ROAD_W.get(rd.get("type"), 5.0) / 2.0
+        for pts3 in _draped_runs(rd["pts"], hw + 0.3,
+                                 ext_target=hw - 0.5, tuck=0.04):
+            if len(side_verts) + 2 * len(pts3) > 60000:
+                flush_side()
+            _emit_flat(pts3, w2, 0.10, side_verts, side_idx)
+            n_side += 1
+    flush_side()
+
+    # — Waterways: draped blue strips. Extended slightly under the road edge
+    #   so creeks crossing the route look like they pass through a culvert.
+    wat_verts, wat_idx = [], []
+    w_part = 0
+
+    def flush_water():
+        nonlocal wat_verts, wat_idx, w_part
+        if wat_verts:
+            meshes.append((f"ENV_WATERWAY_{w_part}", wat_verts, wat_idx,
+                           "water"))
+            w_part += 1
+            wat_verts, wat_idx = [], []
+
+    n_water = 0
+    for ww in surroundings.get("waterways", []):
+        w2 = WATER_W.get(ww.get("type"), 3.0) / 2.0
+        for pts3 in _draped_runs(ww["pts"], hw + 0.3,
+                                 ext_target=hw - 0.5, tuck=0.10):
+            if len(wat_verts) + 2 * len(pts3) > 60000:
+                flush_water()
+            _emit_flat(pts3, w2, 0.05, wat_verts, wat_idx)
+            n_water += 1
+    flush_water()
+
+    # — Barriers: vertical ribbons (fences, walls, hedges, guard rails)
+    #   following the terrain. Not extended into the road. The clip line sits
+    #   just INSIDE the road edge: guard rails are mapped hugging the
+    #   carriageway (often within centimetres of the edge), and the previous
+    #   edge+0.2m threshold silently deleted exactly the rails that matter
+    #   most — the ones on the corners. Only a barrier crossing the road
+    #   interior is removed now.
+    barr = {}          # mat -> [verts, idx, part]
+    barrier_clip = max(0.5, hw - 0.5)
+
+    def flush_barrier(mat):
+        verts_b, idx_b, part_b = barr[mat]
+        if verts_b:
+            meshes.append((f"ENV_BARR_{mat.upper()}_{part_b}", verts_b, idx_b,
+                           mat))
+            barr[mat] = [[], [], part_b + 1]
+
+    n_barr = 0
+    for br in surroundings.get("barriers", []):
+        btype = br.get("type")
+        bh = BARRIER_H.get(btype, 1.2)
+        mat = BARRIER_MAT.get(btype, "building")
+        rail = (btype == "guard_rail")
+        if mat not in barr:
+            barr[mat] = [[], [], 0]
+        for rx_, rz_, rt_, _p, _n in _clip_runs(br["pts"], barrier_clip, step=3.0):
+            verts_b, idx_b, _ = barr[mat]
+            if len(verts_b) + 6 * len(rx_) > 60000:
+                flush_barrier(mat)
+                verts_b, idx_b, _ = barr[mat]
+            dxs_ = np.gradient(rx_); dzs_ = np.gradient(rz_)
+            L = np.sqrt(dxs_**2 + dzs_**2) + 1e-9
+            px_, pz_ = -dzs_ / L, dxs_ / L
+            ux_, uz_ = dxs_ / L, dzs_ / L
+            gys = [ground_y_smooth(float(rx_[k]), float(rz_[k]))
+                   for k in range(len(rx_))]
+            # A solid ground-to-top ribbon reads as a wall. A real armco is a
+            # floating W-beam band on posts, so guard rails get exactly that:
+            # band 0.45-0.80m above ground, plus a post at every sample (3m
+            # spacing) reaching into the ground.
+            lo = 0.45 if rail else -0.2
+            hi = 0.80 if rail else bh
+            v0 = len(verts_b)
+            for k in range(len(rx_)):
+                x_, z_ = float(rx_[k]), float(rz_[k])
+                gy = gys[k]
+                u = float(rt_[k]) * 0.25
+                nx_, nz_ = float(px_[k]), float(pz_[k])
+                verts_b.append(((x_, gy + lo, z_), (nx_, 0, nz_), (u, 0), (1, 0, 0)))
+                verts_b.append(((x_, gy + hi, z_), (nx_, 0, nz_), (u, 1), (1, 0, 0)))
+            for k in range(len(rx_) - 1):
+                a = v0 + k*2
+                idx_b.extend((a, a+2, a+3,  a, a+3, a+1))
+                idx_b.extend((a, a+3, a+2,  a, a+1, a+3))
+            if rail:
+                for k in range(len(rx_)):
+                    x_, z_ = float(rx_[k]), float(rz_[k])
+                    gy = gys[k]
+                    ax_, az_ = float(ux_[k]) * 0.07, float(uz_[k]) * 0.07
+                    nx_, nz_ = float(px_[k]), float(pz_[k])
+                    p0 = len(verts_b)
+                    verts_b.append(((x_ - ax_, gy - 0.10, z_ - az_), (nx_, 0, nz_), (0, 0), (1, 0, 0)))
+                    verts_b.append(((x_ + ax_, gy - 0.10, z_ + az_), (nx_, 0, nz_), (1, 0), (1, 0, 0)))
+                    verts_b.append(((x_ + ax_, gy + 0.72, z_ + az_), (nx_, 0, nz_), (1, 1), (1, 0, 0)))
+                    verts_b.append(((x_ - ax_, gy + 0.72, z_ - az_), (nx_, 0, nz_), (0, 1), (1, 0, 0)))
+                    idx_b.extend((p0, p0+1, p0+2,  p0, p0+2, p0+3))
+                    idx_b.extend((p0, p0+2, p0+1,  p0, p0+3, p0+2))
+            n_barr += 1
+    for mat in list(barr):
+        flush_barrier(mat)
+
+    if n_side or n_water or n_barr:
+        print(f"  [surroundings] draped {n_side} road, {n_water} waterway, "
+              f"{n_barr} barrier strip(s)")
+
+    # ── Trees: hexagonal trunk (bark brown) + low-poly double-cone canopy ──
+    # The old 4-sided pyramid on a green box read as neither tree nor bush.
+    # Now: conifers (tall narrow cone) and broadleaf (rounded blob), each with
+    # random size + rotation so a row of trees doesn't look copy-pasted.
+    trunk_verts, trunk_idx = [], []
+    cans = {"tree": [[], [], 0], "tree2": [[], [], 0]}
+    t_part = 0
+    HEX = 6
+
+    def flush_tree_meshes():
+        nonlocal trunk_verts, trunk_idx, t_part
+        if trunk_verts:
+            meshes.append((f"ENV_TRUNK_{t_part}", trunk_verts, trunk_idx, "dirt"))
+            t_part += 1
+            trunk_verts, trunk_idx = [], []
+        for mat in cans:
+            cv, ci, cp = cans[mat]
+            if cv:
+                suffix = "" if mat == "tree" else "2"
+                meshes.append((f"ENV_TREE{suffix}_{cp}", cv, ci, mat))
+                cans[mat] = [[], [], cp + 1]
 
     rng_t = np.random.default_rng(7)
     for x, z in tree_pts:
         gy = ground_y(x, z)
-        s = rng_t.uniform(0.7, 1.4)                     # size variety
-        th, ch, cr, tr = 2.0*s, 5.0*s, 2.2*s, 0.25*s   # trunk h, canopy h/r, trunk r
+        s   = rng_t.uniform(0.7, 1.5)
+        yaw = rng_t.uniform(0.0, 2.0 * math.pi)
+        if rng_t.random() < 0.5:      # conifer: tall, narrow, tiered
+            th, ch, cr, tr = 1.2*s, 6.5*s, 1.9*s, 0.22*s
+            can_mat = "tree2"          # darker olive canopy
+        else:                         # broadleaf: shorter, rounder blob
+            th, ch, cr, tr = 2.2*s, 5.0*s, 2.6*s, 0.28*s
+            can_mat = "tree"
+        can_verts, can_idx, _ = cans[can_mat]
 
-        if len(verts) + 13 > 60000:
-            flush_trees()
-        v = len(verts)
-        corners = [(-tr,-tr),(tr,-tr),(tr,tr),(-tr,tr)]
-        for cx, cz in corners:
-            verts.append(((x+cx, gy,    z+cz), (cx/tr*0.7, 0, cz/tr*0.7), (0,0), (1,0,0)))
-            verts.append(((x+cx, gy+th, z+cz), (cx/tr*0.7, 0, cz/tr*0.7), (0,1), (1,0,0)))
-        for i in range(4):
-            a = v + i*2; b = v + ((i+1) % 4)*2
-            idx.extend((a, b, b+1,  a, b+1, a+1))
-            idx.extend((a, b+1, b,  a, a+1, b+1))
-        c = len(verts)
-        for cx, cz in [(-cr,-cr),(cr,-cr),(cr,cr),(-cr,cr)]:
-            verts.append(((x+cx, gy+th, z+cz), (cx/cr*0.6, 0.5, cz/cr*0.6), (0,0), (1,0,0)))
-        verts.append(((x, gy+th+ch, z), (0, 1, 0), (0.5, 1), (1, 0, 0)))
-        apex = c + 4
-        for i in range(4):
-            a = c + i; b = c + (i+1) % 4
-            idx.extend((a, b, apex))
-            idx.extend((a, apex, b))
-        idx.extend((c, c+2, c+1,  c, c+3, c+2))
-        idx.extend((c, c+1, c+2,  c, c+2, c+3))
-    flush_trees()
+        if len(trunk_verts) + 2*HEX > 60000 or len(can_verts) + 16 > 60000:
+            flush_tree_meshes()
+            can_verts, can_idx, _ = cans[can_mat]
+
+        # Trunk: hexagonal prism, double-sided
+        v0 = len(trunk_verts)
+        for k in range(HEX):
+            a = yaw + k * 2.0 * math.pi / HEX
+            cx_, cz_ = math.cos(a), math.sin(a)
+            trunk_verts.append(((x+cx_*tr, gy,    z+cz_*tr), (cx_, 0, cz_), (k/HEX, 0), (1, 0, 0)))
+            trunk_verts.append(((x+cx_*tr, gy+th, z+cz_*tr), (cx_, 0, cz_), (k/HEX, 1), (1, 0, 0)))
+        for k in range(HEX):
+            a0 = v0 + k*2
+            b0 = v0 + ((k+1) % HEX)*2
+            trunk_idx.extend((a0, b0, b0+1,  a0, b0+1, a0+1))
+            trunk_idx.extend((a0, b0+1, b0,  a0, a0+1, b0+1))
+
+        # Canopy. Perfect cones read as cartoons; real silhouettes are lumpy.
+        # Broadleaf: a faceted blob — two stacked hex rings with per-vertex
+        # radial jitter and offset yaw, capped by tips. Conifer: two
+        # overlapping cone tiers (the classic pine step), also jittered.
+        c0 = len(can_verts)
+        if can_mat == "tree2":     # conifer: two cone tiers
+            for tier, (ry_f, rr, tip_f) in enumerate(
+                    (((0.0), 1.0, 0.60), ((0.40), 0.62, 1.00))):
+                ring0 = len(can_verts)
+                ry = gy + th + ch * ry_f
+                for k in range(HEX):
+                    a = yaw + (k + 0.5 * tier) * 2.0 * math.pi / HEX
+                    j = rng_t.uniform(0.85, 1.15)
+                    rr_j = cr * rr * j
+                    cx_, cz_ = math.cos(a), math.sin(a)
+                    can_verts.append(((x+cx_*rr_j, ry, z+cz_*rr_j),
+                                      (cx_*0.75, 0.35, cz_*0.75),
+                                      (k/HEX, 0.2 + 0.4*tier), (1, 0, 0)))
+                tip = len(can_verts)
+                can_verts.append(((x, gy+th+ch*tip_f, z), (0, 1, 0),
+                                  (0.5, 1), (1, 0, 0)))
+                for k in range(HEX):
+                    r0 = ring0 + k
+                    r1 = ring0 + (k+1) % HEX
+                    can_idx.extend((r0, r1, tip,  r0, tip, r1))
+        else:                      # broadleaf: jittered faceted blob
+            can_verts.append(((x, gy+th, z), (0, -1, 0), (0.5, 0), (1, 0, 0)))
+            rings = []
+            for ri, (hf, rf) in enumerate(((0.30, 1.00), (0.72, 0.78))):
+                ring0 = len(can_verts)
+                rings.append(ring0)
+                ry = gy + th + ch * hf
+                for k in range(HEX):
+                    a = yaw + (k + 0.5 * ri) * 2.0 * math.pi / HEX
+                    j = rng_t.uniform(0.80, 1.20)
+                    rr_j = cr * rf * j
+                    cx_, cz_ = math.cos(a), math.sin(a)
+                    can_verts.append(((x+cx_*rr_j, ry + rng_t.uniform(-0.15, 0.15)*s,
+                                       z+cz_*rr_j),
+                                      (cx_*0.8, 0.25 + 0.3*ri, cz_*0.8),
+                                      (k/HEX, 0.3 + 0.35*ri), (1, 0, 0)))
+            top_v = len(can_verts)
+            can_verts.append(((x, gy+th+ch, z), (0, 1, 0), (0.5, 1), (1, 0, 0)))
+            for k in range(HEX):
+                a0 = rings[0] + k;  a1 = rings[0] + (k+1) % HEX
+                b0 = rings[1] + k;  b1 = rings[1] + (k+1) % HEX
+                can_idx.extend((c0, a1, a0,  c0, a0, a1))          # bottom fan
+                can_idx.extend((a0, a1, b1,  a0, b1, b0))          # band
+                can_idx.extend((a0, b1, a1,  a0, b0, b1))
+                can_idx.extend((b0, b1, top_v,  b0, top_v, b1))    # top fan
+    flush_tree_meshes()
 
     return {"meshes": meshes, "n_trees": len(tree_pts),
             "n_buildings": len(surroundings.get("buildings", []))}
@@ -528,54 +1276,584 @@ def build_environment_meshes(surroundings: dict, mesh: dict,
 
 # ─── Elevation ────────────────────────────────────────────────────────────────
 
-# Disk cache: repeated exports of the same road cost zero API calls.
-_ELEV_CACHE_PATH = os.path.join(OUTPUT_DIR, "elev_cache.json")
-try:
-    with open(_ELEV_CACHE_PATH) as _f:
-        _elev_cache = json.load(_f)
-except Exception:
-    _elev_cache = {}
+# ─── Terrarium raster tiles (AWS Open Data — no key, no rate limit) ───────────
+# The point-query elevation APIs are the bottleneck in this tool: opentopodata
+# allows 100 points/call at 1 call/sec, so dense sampling is impossible. AWS
+# Terrain Tiles serve DEM as ordinary PNG raster tiles instead — one 256×256
+# tile carries 65,536 samples in a single request, cached on disk, after which
+# sampling any point is free and local. Terrarium encodes height in the pixel:
+#     elevation_m = R*256 + G + B/256 - 32768
+# Tiles are standard slippy-map (Web Mercator) tiles.
+# Dataset: https://registry.opendata.aws/terrain-tiles/  (approach per the
+# Apache-2.0 project github.com/louis-e/arnis, implemented here from the spec).
+
+TERRARIUM_URL = "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png"
+TILE_CACHE_DIR = os.path.join(OUTPUT_DIR, "tiles")
+TERRARIUM_MIN_ZOOM = 10
+TERRARIUM_MAX_ZOOM = 15      # ~4.8 m/px — same max zoom as arnis; the finer
+                             # sampling grid interpolates slopes more smoothly
+                             # even where the source DEM is ~30 m
+TERRARIUM_MAX_TILES = 256    # per export; zoom drops until the budget is met.
+                             # Tiles are ~30 KB, so a generous budget keeps
+                             # long roads at max zoom instead of degrading to
+                             # coarse DEM (which smears valleys into the road).
+
+_tile_mem = {}               # (z,x,y) -> 256×256 float array, or None if absent
 
 
-def _ck(c):
-    return f"{c[0]:.5f},{c[1]:.5f}"      # ~1m precision
+def _tile_xy(lat, lon, zoom):
+    """Fractional GLOBAL pixel coords (256px tiles) for a lat/lon."""
+    n = 2.0 ** zoom
+    fx = (lon + 180.0) / 360.0 * n * 256.0
+    lat_r = math.radians(max(-85.05, min(85.05, lat)))
+    fy = (1.0 - math.asinh(math.tan(lat_r)) / math.pi) / 2.0 * n * 256.0
+    return fx, fy
 
 
-def _save_elev_cache():
+def _pick_zoom(coords):
+    """
+    Highest zoom whose tile count fits the budget. Counts only the tiles the
+    route actually touches, not its bounding box — a long diagonal road covers
+    a huge bbox but a thin corridor, and counting the bbox would drop the zoom
+    (and the terrain's accuracy) for no reason.
+    """
+    step = max(1, len(coords) // 400)
+    sample = coords[::step] + [coords[-1]]
+    for z in range(TERRARIUM_MAX_ZOOM, TERRARIUM_MIN_ZOOM - 1, -1):
+        tiles = set()
+        for c in sample:
+            fx, fy = _tile_xy(c[0], c[1], z)
+            tx, ty = int(fx // 256), int(fy // 256)
+            # neighbours too: bilinear reads one pixel past a tile edge
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    tiles.add((tx + dx, ty + dy))
+        if len(tiles) <= TERRARIUM_MAX_TILES:
+            return z
+    return TERRARIUM_MIN_ZOOM
+
+
+def _load_tile(z, x, y):
+    """Decoded 256×256 elevation array for a tile, or None. Disk + memory cached."""
+    key = (z, x, y)
+    if key in _tile_mem:
+        return _tile_mem[key]
+
     try:
-        with open(_ELEV_CACHE_PATH, 'w') as f:
-            json.dump(_elev_cache, f)
-    except Exception:
-        pass
+        from PIL import Image
+    except ImportError:
+        raise ElevationUnavailable(
+            "Pillow is not installed — run: pip install pillow")
+
+    os.makedirs(TILE_CACHE_DIR, exist_ok=True)
+    path = os.path.join(TILE_CACHE_DIR, f"z{z}_x{x}_y{y}.png")
+
+    if not os.path.exists(path):
+        url = TERRARIUM_URL.format(z=z, x=x, y=y)
+        data = None
+        for attempt in (1, 2, 3):
+            try:
+                req = Request(url, headers={"User-Agent": "AC-Road-Tool/1.0"})
+                with urlopen(req, timeout=20) as r:
+                    data = r.read()
+                break
+            except Exception as e:
+                if attempt == 3:
+                    raise ElevationUnavailable(
+                        f"could not download elevation tile {z}/{x}/{y} from "
+                        f"AWS Terrain Tiles: {e}")
+                time.sleep(0.5 * attempt)
+        try:
+            with open(path, 'wb') as f:
+                f.write(data)
+        except Exception:
+            pass
+
+    try:
+        with Image.open(path) as im:
+            arr = np.asarray(im.convert("RGB"), dtype=np.float64)
+    except Exception as e:
+        # corrupt tile: drop it so the next run refetches
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+        raise ElevationUnavailable(
+            f"elevation tile {z}/{x}/{y} was corrupt ({e}) — it has been "
+            f"deleted from the cache, try the export again")
+
+    elev = arr[:, :, 0] * 256.0 + arr[:, :, 1] + arr[:, :, 2] / 256.0 - 32768.0
+    _tile_mem[key] = elev
+    return elev
 
 
-def fetch_elevations(coords: list, prefer_openmeteo: bool = False):
+def _tile_pixel(z, tx, ty, px, py):
+    """One pixel, following tile boundary crossover. None if the tile is missing."""
+    if px < 0:
+        tx, px = tx - 1, px + 256
+    elif px >= 256:
+        tx, px = tx + 1, px - 256
+    if py < 0:
+        ty, py = ty - 1, py + 256
+    elif py >= 256:
+        ty, py = ty + 1, py - 256
+    return float(_load_tile(z, tx, ty)[py, px])
+
+
+def _prefetch_tiles(coords, z, workers=8):
+    """Download every tile the sample points need, in parallel."""
+    need = set()
+    for c in coords:
+        fx, fy = _tile_xy(c[0], c[1], z)
+        tx, ty = int(fx // 256), int(fy // 256)
+        for dx in (0, 1, -1):
+            for dy in (0, 1, -1):
+                need.add((tx + dx, ty + dy))
+    todo = [t for t in need if (z,) + t not in _tile_mem]
+    if not todo:
+        return
+    errors = []
+
+    def grab(t):
+        try:
+            _load_tile(z, t[0], t[1])
+        except ElevationUnavailable as e:
+            errors.append(e)
+
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        list(ex.map(grab, todo))
+    if errors:
+        raise errors[0]
+
+
+def _fetch_terrarium(coords):
     """
-    Cached, rate-limit-friendly elevation lookup. Serves hits from the
-    disk cache and only queries the APIs for misses. Large batches
-    (terrain grids) should prefer open-meteo, whose free limits are far
-    higher (600/min, 10k/day) than opentopodata's (1/sec, 1000/day).
-    Returns list of floats or None.
+    Elevations from AWS Terrain Tiles, bilinearly interpolated.
+    Raises ElevationUnavailable if the data cannot be obtained — there is no
+    silent degradation to a worse source.
     """
-    missing = [c for c in coords if _ck(c) not in _elev_cache]
-    if missing:
-        n_hit = len(coords) - len(missing)
-        if n_hit:
-            print(f"  [elevation] {n_hit}/{len(coords)} from cache, "
-                  f"fetching {len(missing)}")
-        order = ([_fetch_openmeteo, _fetch_opentopodata] if prefer_openmeteo
-                 else [_fetch_opentopodata, _fetch_openmeteo])
-        got = order[0](missing)
-        if got is None:
-            got = order[1](missing)
-        if got is None:
+    if not coords:
+        return []
+    z = _pick_zoom(coords)
+    _prefetch_tiles(coords, z)
+    out = []
+    for c in coords:
+        lat, lon = c[0], c[1]
+        fx, fy = _tile_xy(lat, lon, z)
+        tx, ty = int(fx // 256), int(fy // 256)
+        px, py = fx - tx * 256.0, fy - ty * 256.0
+        x0, y0 = int(math.floor(px)), int(math.floor(py))
+        dx, dy = px - x0, py - y0
+        v00 = _tile_pixel(z, tx, ty, x0,     y0)
+        v10 = _tile_pixel(z, tx, ty, x0 + 1, y0)
+        v01 = _tile_pixel(z, tx, ty, x0,     y0 + 1)
+        v11 = _tile_pixel(z, tx, ty, x0 + 1, y0 + 1)
+        top = v00 + (v10 - v00) * dx
+        bot = v01 + (v11 - v01) * dx
+        out.append(top + (bot - top) * dy)
+    n_tiles = sum(1 for k in _tile_mem if k[0] == z)
+    print(f"  [terrarium] {len(coords)} points from {n_tiles} tiles @ z{z}")
+    return out
+
+
+# ─── Local high-resolution DEMs (e.g. ELVIS LiDAR GeoTIFFs) ──────────────────
+#
+# Drop GeoTIFF DEM files (.tif) into the ./dem folder next to this script and
+# they are preferred over the online tiles wherever they cover. Intended for
+# Geoscience Australia ELVIS LiDAR DEMs (1m bare-earth, elevation.fsdf.org.au)
+# but any georeferenced elevation GeoTIFF works — CRS is read from the file.
+# Requires rasterio (pip install rasterio). Points outside local coverage fall
+# back to the online tiles, datum-aligned so the seam is minimal.
+
+LOCAL_DEM_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dem")
+_local_dems = None
+_local_dem_sig = None
+
+
+def _load_local_dems(refresh: bool = False) -> list:
+    """Cached list of loaded local DEMs, finest resolution first."""
+    global _local_dems, _local_dem_sig
+    if not os.path.isdir(LOCAL_DEM_DIR):
+        _local_dems = []
+        return _local_dems
+    files = sorted(f for f in os.listdir(LOCAL_DEM_DIR)
+                   if f.lower().endswith((".tif", ".tiff")))
+    sig = tuple((f, os.path.getmtime(os.path.join(LOCAL_DEM_DIR, f)))
+                for f in files)
+    if _local_dems is not None and (not refresh or sig == _local_dem_sig):
+        return _local_dems
+    _local_dem_sig = sig
+    _local_dems = []
+    if not files:
+        return _local_dems
+    try:
+        import rasterio
+    except ImportError:
+        print(f"  [dem] {len(files)} GeoTIFF(s) found in ./dem but rasterio "
+              f"is not installed — run: pip install rasterio")
+        return _local_dems
+    for fn in files:
+        path = os.path.join(LOCAL_DEM_DIR, fn)
+        try:
+            with rasterio.open(path) as ds:
+                arr = ds.read(1).astype(np.float32)
+                if ds.nodata is not None:
+                    arr[arr == ds.nodata] = np.nan
+                arr[arr < -1000] = np.nan          # common sentinel values
+                tr = Transformer.from_crs("EPSG:4326", ds.crs,
+                                          always_xy=True)
+                res = max(abs(ds.transform.a), abs(ds.transform.e))
+                # WGS84 bounds so the UI can draw the coverage on the map
+                inv_tr = Transformer.from_crs(ds.crs, "EPSG:4326",
+                                              always_xy=True)
+                b = ds.bounds
+                lons, lats = inv_tr.transform(
+                    [b.left, b.right, b.right, b.left],
+                    [b.top, b.top, b.bottom, b.bottom])
+                bounds = [min(lats), min(lons), max(lats), max(lons)]
+                _local_dems.append({"name": fn, "arr": arr, "tr": tr,
+                                    "inv": ~ds.transform, "res": res,
+                                    "w": ds.width, "h": ds.height,
+                                    "bounds": bounds})
+                print(f"  [dem] loaded {fn}: {ds.width}×{ds.height} px @ "
+                      f"{res:.1f} m/px ({ds.crs})")
+        except Exception as e:
+            print(f"  [dem] could not load {fn}: {e}")
+    _local_dems.sort(key=lambda d: d["res"])       # finest wins on overlap
+    return _local_dems
+
+
+def _sample_local_dem(lat: float, lon: float):
+    """Bilinear sample from the finest local DEM covering the point, or None."""
+    for d in _local_dems or []:
+        try:
+            x, y = d["tr"].transform(lon, lat)
+            col, row = d["inv"] * (x, y)
+        except Exception:
+            continue
+        c0 = int(math.floor(col - 0.5))
+        r0 = int(math.floor(row - 0.5))
+        if c0 < 0 or r0 < 0 or c0 + 1 >= d["w"] or r0 + 1 >= d["h"]:
+            continue
+        q = d["arr"][r0:r0 + 2, c0:c0 + 2]
+        if np.isnan(q).any():
+            continue
+        fx = (col - 0.5) - c0
+        fy = (row - 0.5) - r0
+        return float(q[0, 0] * (1 - fx) * (1 - fy) + q[0, 1] * fx * (1 - fy)
+                     + q[1, 0] * (1 - fx) * fy + q[1, 1] * fx * fy)
+    return None
+
+
+def _local_dem_coverage(coords: list) -> float:
+    """Fraction of the given points covered by loaded local DEMs (0-1)."""
+    if not _local_dems or not coords:
+        return 0.0
+    step = max(1, len(coords) // 400)
+    pts = coords[::step]
+    hit = sum(1 for c in pts if _sample_local_dem(c[0], c[1]) is not None)
+    return hit / len(pts)
+
+
+def dem_status() -> dict:
+    """Elevation mode + loaded local DEMs, for the UI."""
+    dems = _load_local_dems(refresh=True)
+    return {
+        "mode": "manual" if dems else "auto",
+        "dems": [{"name": d["name"], "res_m": round(d["res"], 2),
+                  "bounds": d["bounds"]} for d in dems],
+    }
+
+
+def fetch_elevations(coords: list, prefer_openmeteo: bool = False,
+                     tiles_only: bool = True):
+    """Elevation for a list of [lat, lon]. Prefers local GeoTIFF DEMs (./dem)
+    where they cover; online tiles elsewhere, datum-aligned across the seam.
+    Raises ElevationUnavailable."""
+    dems = _load_local_dems(refresh=True)
+    if not dems:
+        return _fetch_terrarium(coords)
+
+    vals = [_sample_local_dem(c[0], c[1]) for c in coords]
+    missing = [i for i, v in enumerate(vals) if v is None]
+    n_local = len(vals) - len(missing)
+    if n_local == 0:
+        return _fetch_terrarium(coords)
+    if not missing:
+        return [float(v) for v in vals]
+
+    # Mixed coverage: fill gaps from the online tiles, shifted by the median
+    # local-vs-tile difference over covered points so the vertical datums
+    # (LiDAR AHD vs tile EGM96) don't create a step at the coverage boundary.
+    covered = [i for i, v in enumerate(vals) if v is not None]
+    probe = covered[::max(1, len(covered) // 150)]
+    fill = _fetch_terrarium([coords[i] for i in missing]
+                            + [coords[i] for i in probe])
+    off = float(np.median([vals[i] - fill[len(missing) + k]
+                           for k, i in enumerate(probe)]))
+    for k, i in enumerate(missing):
+        vals[i] = float(fill[k]) + off
+    print(f"  [dem] local DEM covered {n_local}/{len(vals)} points; "
+          f"{len(missing)} filled from online tiles "
+          f"(datum offset {off:+.1f} m)")
+    return vals
+
+
+OPENMETEO_URL = "https://api.open-meteo.com/v1/elevation"
+
+
+def fetch_elevations_copernicus(coords: list, max_pts: int = 300):
+    """
+    Independent second opinion on the elevation profile. Open-Meteo serves
+    Copernicus GLO-90 — a radar DEM from a different satellite mission
+    (TanDEM-X, ~2011-2015) than the SRTM-era data behind AWS Terrain Tiles —
+    so its errors are independent: where both agree a feature is probably
+    real terrain; where they disagree, at least one is an artefact.
+    Returns (step, elevations) sampling coords[::step], or None on failure.
+    """
+    if len(coords) < 2:
+        return None
+    step = max(1, (len(coords) + max_pts - 1) // max_pts)
+    pts = coords[::step]
+    out = []
+    for i in range(0, len(pts), 100):        # API takes ≤100 points per call
+        chunk = pts[i:i + 100]
+        lats = ",".join(f"{c[0]:.6f}" for c in chunk)
+        lons = ",".join(f"{c[1]:.6f}" for c in chunk)
+        req = Request(f"{OPENMETEO_URL}?latitude={lats}&longitude={lons}",
+                      headers={"User-Agent": "AC-Road-Tool/1.0"})
+        with urlopen(req, timeout=15) as r:
+            data = json.loads(r.read())
+        vals = data.get("elevation") or []
+        if len(vals) != len(chunk):
             return None
-        for c, e in zip(missing, got):
-            _elev_cache[_ck(c)] = float(e or 0)
-        _save_elev_cache()
-    return [_elev_cache[_ck(c)] for c in coords]
+        out.extend(float(v) for v in vals)
+    return step, out
 
-def fetch_elevation_profile(coords: list) -> dict:
+
+def _flatten_structures(elevs: list, flags: list) -> list:
+    """
+    Replace elevation across bridge and tunnel spans with a straight grade
+    between the ground heights at each end. DEM measures the ground, so a
+    bridge would otherwise plunge into the valley it crosses and a tunnel
+    would climb over the mountain it bores through.
+    """
+    if not flags or max(flags) < 0.5:
+        return elevs
+    e = list(elevs)
+    n = len(e)
+    i = 0
+    spans = 0
+    while i < n:
+        if flags[i] < 0.5:
+            i += 1
+            continue
+        j = i
+        while j < n and flags[j] >= 0.5:
+            j += 1
+        # anchor on the last/first solid ground either side of the span
+        a, b = i - 1, j
+        ya = e[a] if a >= 0 else (e[b] if b < n else e[i])
+        yb = e[b] if b < n else ya
+        span = (b - a) if (a >= 0 and b < n) else max(1, j - i)
+        for k in range(i, j):
+            t = (k - a) / span if span else 0.0
+            e[k] = ya + (yb - ya) * t
+        spans += 1
+        i = j
+    if spans:
+        print(f"  [elevation] {spans} bridge/tunnel span(s) levelled")
+    return e
+
+
+def _despike_1d(e: list, win: int = 3, k: float = 4.0) -> list:
+    """
+    Median/MAD de-spike along a 1-D elevation profile. Raw DEM tiles contain
+    occasional bad pixels; sampled onto the road they become phantom hills the
+    car has to climb. A median is robust to isolated outliers while leaving a
+    genuine steep grade (where the whole neighbourhood moves together) intact.
+    """
+    a = np.asarray(e, dtype=float)
+    n = len(a)
+    if n < 2 * win + 1:
+        return [float(v) for v in a]
+    out = a.copy()
+    for i in range(n):
+        i0, i1 = max(0, i - win), min(n, i + win + 1)
+        nb = a[i0:i1]
+        med = float(np.median(nb))
+        mad = float(np.median(np.abs(nb - med)))
+        # 2 m floor: below that we're inside DEM quantisation noise, not signal
+        if abs(a[i] - med) > k * max(mad, 2.0):
+            out[i] = med
+    return [float(v) for v in out]
+
+
+def _auto_max_grade(dists: list, elevs: list) -> float:
+    """
+    Estimate a grade limit from the road's own long-baseline trend.
+    A ~800m rolling median erases DEM artefacts up to ~400m wide (gully
+    crossings, canopy steps) while keeping genuine sustained climbs and
+    broad valleys, so the trend's steepest grade is the road's real
+    steepness. The limit is set comfortably above that: artefacts (whose
+    walls are far steeper than the road ever is) get bridged, genuinely
+    steep or dippy roads raise their own limit and keep their character.
+    """
+    e = np.asarray(elevs, dtype=float)
+    d = np.asarray(dists, dtype=float)
+    n = len(e)
+    if n < 20 or d[-1] <= d[0]:
+        return 0.35
+    spacing = (d[-1] - d[0]) / (n - 1)
+    win = int(800.0 / max(spacing, 1e-9))
+    win = max(5, min(win | 1, n if n % 2 else n - 1))     # odd, ≤ n
+    trend = median_filter(e, size=win, mode='nearest')
+    g = np.abs(np.gradient(trend, d))
+    limit = float(np.percentile(g, 95)) * 1.5 + 0.02
+    return min(0.35, max(0.07, limit))
+
+
+def _limit_grade(dists: list, elevs: list, max_grade: float = 0.35,
+                 iters: int = 200) -> list:
+    """
+    Remove physically impossible road grades. DEM artefacts wider than the
+    de-spike window (tile seams, void-fill blobs, valley smear) survive the
+    median filter and become huge phantom rises/dips in the road. No drivable
+    road sustains anywhere near a 35% grade, so samples that create one are
+    treated as bad data and re-interpolated from the surrounding good samples.
+    Iterates to convergence (each pass widens the bridged region): a tall
+    plateau artefact — e.g. a canopy block on a flat road — needs its whole
+    footprint bridged, not just its steep walls. Each pass is O(n), so cheap.
+    """
+    e = np.asarray(elevs, dtype=float)
+    d = np.asarray(dists, dtype=float)
+    if len(e) < 3:
+        return [float(v) for v in e]
+    fixed = 0
+    for _ in range(iters):
+        seg = np.maximum(np.diff(d), 1e-9)
+        bad_seg = np.abs(np.diff(e)) / seg > max_grade
+        if not bad_seg.any():
+            break
+        bad = np.zeros(len(e), dtype=bool)
+        bad[:-1] |= bad_seg
+        bad[1:]  |= bad_seg
+        good = ~bad
+        if good.sum() < 2:
+            break
+        e[bad] = np.interp(d[bad], d[good], e[good])
+        fixed += int(bad.sum())
+    if fixed:
+        print(f"  [elevation] {fixed} sample(s) exceeded {max_grade:.0%} "
+              f"grade — re-interpolated (DEM artefacts)")
+    return [float(v) for v in e]
+
+
+DEM_REGISTRATION_M = 15.0   # assumed horizontal uncertainty of the DEM (m)
+
+
+def _corridor_elevations(sample_coords: list, half_width_m: float = 15.0,
+                         registration_m: float = None):
+    """
+    Sample the DEM ACROSS the road corridor, not just at one point on the
+    centreline.
+
+    A point sample assumes the DEM knows exactly where the road is. It does
+    not: ~30 m cells plus OSM geometry error put the true road anywhere
+    within ~15 m of the sampled point. On flat ground that hardly matters.
+    On a road cut into a hillside — bank one side, drop the other — a 15 m
+    HORIZONTAL error becomes a 15 m VERTICAL error, and as the road curves
+    against the contours that error swings: phantom dips and rises.
+
+    At each station a 5-point cross-section is sampled and a quadratic is
+    fitted across it, evaluated at the centreline. With symmetric offsets
+    that estimate is exactly unbiased for any locally planar or parabolic
+    cross-section (so a hillside or a valley floor is not skewed), while
+    averaging ~half the per-pixel noise of a single sample.
+
+    The fitted cross-slope also tells us how unreliable each station is:
+    uncertainty ≈ cross-slope × registration error. That is reported rather
+    than silently hidden, because on a steep sidehill no amount of processing
+    can recover a narrow road bench a 30 m DEM never resolved.
+
+    Returns (fitted, centre, cross_slope, uncertainty_m).
+    """
+    offsets = [-half_width_m, -half_width_m / 2, 0.0,
+               half_width_m / 2, half_width_m]
+    n = len(sample_coords)
+    query = []
+    for i, c in enumerate(sample_coords):
+        i0, i1 = max(0, i - 1), min(n - 1, i + 1)
+        coslat = max(1e-9, math.cos(math.radians(c[0])))
+        dn = (sample_coords[i1][0] - sample_coords[i0][0]) * 111320.0
+        de = (sample_coords[i1][1] - sample_coords[i0][1]) * 111320.0 * coslat
+        L = math.hypot(de, dn) or 1.0
+        pe, pn = -dn / L, de / L                 # perpendicular (east, north)
+        for m in offsets:
+            query.append([c[0] + pn * m / 111320.0,
+                          c[1] + pe * m / (111320.0 * coslat)])
+
+    vals = np.array(fetch_elevations(query), dtype=float).reshape(n, len(offsets))
+    centre = vals[:, len(offsets) // 2]
+
+    o  = np.array(offsets, dtype=float)
+    S2 = float((o ** 2).sum())
+    S4 = float((o ** 4).sum())
+    det = S4 * len(o) - S2 * S2
+    A = (vals * (o ** 2)).sum(axis=1)
+    B = vals.sum(axis=1)
+    fitted = (S4 * B - S2 * A) / det             # quadratic value at offset 0
+    slope  = (vals * o).sum(axis=1) / S2         # cross-slope (m/m)
+
+    cross = np.abs(slope)
+    unc = cross * (registration_m if registration_m is not None
+                   else DEM_REGISTRATION_M)
+    steep = float((cross > 0.25).mean())
+    print(f"  [elevation] corridor sampling: {steep:.0%} of route on steep "
+          f"sidehill, typical uncertainty ±{float(np.median(unc)):.1f} m "
+          f"(max ±{float(unc.max()):.1f} m)")
+    return ([float(v) for v in fitted], [float(v) for v in centre],
+            cross, unc)
+
+
+def _pava(y: list) -> list:
+    """Pool Adjacent Violators: least-squares non-decreasing fit. O(n)."""
+    vals, wts, cnts = [], [], []
+    for v in y:
+        vals.append(float(v)); wts.append(1.0); cnts.append(1)
+        while len(vals) > 1 and vals[-2] > vals[-1]:
+            w = wts[-2] + wts[-1]
+            vals[-2] = (vals[-2]*wts[-2] + vals[-1]*wts[-1]) / w
+            wts[-2] = w; cnts[-2] += cnts[-1]
+            vals.pop(); wts.pop(); cnts.pop()
+    out = []
+    for v, c in zip(vals, cnts):
+        out.extend([v] * c)
+    return out
+
+
+def _monotonic_profile(elevs: list) -> list:
+    """
+    Force the profile monotonic in the direction of its net elevation change
+    (isotonic regression). For a road the user knows climbs (or descends)
+    steadily, any dip is by definition a DEM artefact — gully crossings on
+    embankments/culverts the DEM can't see — and the least-squares monotonic
+    fit removes exactly those while leaving already-monotonic sections
+    untouched.
+    """
+    if len(elevs) < 3:
+        return [float(v) for v in elevs]
+    inc = elevs[-1] >= elevs[0]
+    y = elevs if inc else [-v for v in elevs]
+    fit = _pava(y)
+    fixed = sum(1 for a, b in zip(y, fit) if abs(a - b) > 0.01)
+    if fixed:
+        print(f"  [elevation] steady-climb fit adjusted {fixed} sample(s)")
+    return fit if inc else [-v for v in fit]
+
+
+def fetch_elevation_profile(coords: list, max_grade: float = None,
+                            monotonic: bool = False) -> dict:
     """
     Sample elevation at UNIFORM DISTANCE intervals along the route
     (not at the raw GPS nodes, which are unevenly spaced — dense in
@@ -593,22 +1871,64 @@ def fetch_elevation_profile(coords: list) -> dict:
                                             coords[i][0],   coords[i][1]))
     total = dists[-1]
 
-    # Uniform samples: every 20 m, capped at 500 API points.
-    # SRTM is ~30 m resolution, so denser sampling adds nothing.
-    interval = max(20.0, total / 499.0)
-    n_samples = max(int(total / interval) + 1, 4)
-    sample_d = [min(i * interval, total) for i in range(n_samples)]
-
+    # Tile-backed elevation has no request limits, so sample densely (every
+    # 10 m, up to 4000 points) for a gradient true to the real hill.
     lat_f = interp1d(dists, [c[0] for c in coords])
     lon_f = interp1d(dists, [c[1] for c in coords])
+    # 3rd element (if present) flags bridge/tunnel spans
+    flags = [float(c[2]) if len(c) > 2 else 0.0 for c in coords]
+    flag_f = interp1d(dists, flags)
+
+    interval = max(10.0, total / 3999.0)
+    n_samples = max(int(total / interval) + 1, 4)
+    sample_d = [min(i * interval, total) for i in range(n_samples)]
     sample_coords = [[float(lat_f(d)), float(lon_f(d))] for d in sample_d]
+    sample_flags = [float(flag_f(d)) for d in sample_d]
 
-    elevs = fetch_elevations(sample_coords)   # small batch: SRTM 30m first
-    if elevs is None:
-        print("  [elevation] APIs unavailable — using flat terrain")
-        return None
+    # ── Pick the pipeline for the data quality ──
+    # The corrections below exist to fight coarse-DEM errors. On LiDAR they
+    # can't tell a real feature from an artefact, so when a local high-res
+    # DEM covers the road they step aside:
+    #  - corridor narrows ±15m → ±3m (LiDAR resolves the road bench itself;
+    #    a wide cross-section would average cut batters into the road)
+    #  - registration uncertainty 15m → 1m (survey-grade georeferencing)
+    #  - auto grade limiting off (a steep pinch in LiDAR is real)
+    #  - profile smoothing 30m → 8m (keep real crests and compressions)
+    # Bridge/tunnel flattening stays ON in both modes: bare-earth LiDAR
+    # removes bridge decks too, so the road still needs levelling there.
+    _load_local_dems(refresh=True)
+    dem_cov = _local_dem_coverage(sample_coords)
+    hires = dem_cov > 0.9
+    dem_mode = "manual" if _local_dems else "auto"
+    if hires:
+        print(f"  [elevation] local DEM covers {dem_cov:.0%} of the road — "
+              f"high-resolution pipeline (narrow corridor, minimal "
+              f"smoothing, no auto grade limit)")
 
-    return {"dists": sample_d, "elevs": elevs}
+    elevs, centre, cross, unc = _corridor_elevations(
+        sample_coords,
+        half_width_m=3.0 if hires else 15.0,
+        registration_m=1.0 if hires else DEM_REGISTRATION_M)
+    raw = centre                        # naive point sample, for diagnostics
+    elevs = _despike_1d(elevs)
+    if max_grade is None:
+        if hires:
+            max_grade = 0.35            # effectively off: trust the data
+        else:
+            max_grade = _auto_max_grade(sample_d, elevs)
+            print(f"  [elevation] auto grade limit: {max_grade:.0%}")
+    elevs = _limit_grade(sample_d, elevs, max_grade=max_grade)
+    elevs = _flatten_structures(elevs, sample_flags)
+    if monotonic:
+        elevs = _monotonic_profile(elevs)
+    return {"dists": sample_d, "elevs": elevs, "raw_elevs": raw,
+            "coords": sample_coords,
+            "uncert": [float(v) for v in unc],
+            "sidehill_frac": float((cross > 0.25).mean()),
+            "uncert_med": float(np.median(unc)),
+            "dem_mode": dem_mode,
+            "dem_coverage": dem_cov,
+            "smooth_sigma": 8.0 if hires else 30.0}
 
 
 def fetch_elevation(coords: list) -> list:
@@ -625,66 +1945,204 @@ def fetch_elevation(coords: list) -> list:
     return [float(f(d)) for d in dists]
 
 
-def _fetch_opentopodata(coords):
-    # Public limits: 100 locations/call, 1 call/second, 1000 calls/day.
-    BATCH = 100
-    results = []
-    for i in range(0, len(coords), BATCH):
-        batch = coords[i:i+BATCH]
-        loc = "|".join(f"{c[0]},{c[1]}" for c in batch)
-        for attempt in (1, 2):
-            try:
-                req = Request(f"https://api.opentopodata.org/v1/srtm30m?locations={loc}",
-                              headers={"User-Agent": "AC-Road-Tool/1.0"})
-                with urlopen(req, timeout=15) as r:
-                    data = json.loads(r.read())
-                if data.get("status") != "OK":
-                    return None
-                results.extend(float(p["elevation"] or 0) for p in data["results"])
-                break
-            except Exception as e:
-                if "429" in str(e) and attempt == 1:
-                    print(f"  [opentopodata] rate limited — backing off 5s…")
-                    time.sleep(5.0)
-                    continue
-                print(f"  [opentopodata] {e}")
-                return None
-        if i + BATCH < len(coords):
-            time.sleep(1.05)          # respect the 1 call/second limit
-    return results if len(results) == len(coords) else None
+# ─── ESA WorldCover 2021 (global 10 m land cover, free on AWS S3) ────────────
+# OSM only knows what a mapper drew, so vegetation is patchy outside towns.
+# WorldCover classifies every 10 m of ground on Earth, so trees and surface
+# type work even where nobody has mapped a forest polygon.
+# Files are Cloud-Optimised GeoTIFFs covering 3°×3° — far too big to download,
+# so we parse the TIFF header and pull only the internal tiles we need via HTTP
+# Range requests. Dataset: https://esa-worldcover.s3.eu-central-1.amazonaws.com
+# (CC-BY 4.0, © ESA WorldCover project 2021 / Contains modified Copernicus data)
+
+ESA_BASE_URL = ("https://esa-worldcover.s3.eu-central-1.amazonaws.com"
+                "/v200/2021/map")
+ESA_TILE_DEG = 3
+LC_CACHE_DIR = os.path.join(OUTPUT_DIR, "landcover")
+
+# WorldCover class codes
+LC_TREE, LC_SHRUB, LC_GRASS, LC_CROP, LC_BUILT = 10, 20, 30, 40, 50
+LC_BARE, LC_SNOW, LC_WATER, LC_WETLAND, LC_MANGROVE, LC_MOSS = 60, 70, 80, 90, 95, 100
+
+_cog_hdr_cache = {}     # url -> parsed header
+_cog_tile_cache = {}    # (url, tile_index) -> uint8 array
 
 
-def _fetch_openmeteo(coords):
-    # Free limits: ~600 calls/min, 10k/day — the roomier option for
-    # large terrain batches.
-    BATCH = 100
-    results = []
-    for i in range(0, len(coords), BATCH):
-        batch = coords[i:i+BATCH]
-        lats = ",".join(str(c[0]) for c in batch)
-        lons = ",".join(str(c[1]) for c in batch)
-        for attempt in (1, 2):
+def _esa_tile_url(lat, lon):
+    """WorldCover file covering a point (tiles named by their SW corner)."""
+    tlat = int(math.floor(lat / ESA_TILE_DEG) * ESA_TILE_DEG)
+    tlon = int(math.floor(lon / ESA_TILE_DEG) * ESA_TILE_DEG)
+    ns = "N" if tlat >= 0 else "S"
+    ew = "E" if tlon >= 0 else "W"
+    name = (f"ESA_WorldCover_10m_2021_v200_"
+            f"{ns}{abs(tlat):02d}{ew}{abs(tlon):03d}_Map.tif")
+    return f"{ESA_BASE_URL}/{name}"
+
+
+def _http_range(url, start, length):
+    """Fetch a byte range. Returns bytes or None."""
+    req = Request(url, headers={"User-Agent": "AC-Road-Tool/1.0",
+                                "Range": f"bytes={start}-{start + length - 1}"})
+    with urlopen(req, timeout=25) as r:
+        return r.read()
+
+
+def _parse_cog_header(url):
+    """
+    Minimal TIFF/COG header parse: enough to locate internal tiles.
+    Returns dict with geotransform, tile layout and per-tile byte ranges.
+    """
+    if url in _cog_hdr_cache:
+        return _cog_hdr_cache[url]
+
+    head = _http_range(url, 0, 131072)
+    if not head or len(head) < 8:
+        raise IOError("empty TIFF header")
+    bo = "<" if head[:2] == b"II" else ">"
+    magic = struct.unpack(bo + "H", head[2:4])[0]
+    if magic != 42:
+        raise IOError(f"not a classic TIFF (magic {magic})")
+    ifd_off = struct.unpack(bo + "I", head[4:8])[0]
+
+    def u(fmt, off):
+        return struct.unpack_from(bo + fmt, head, off)
+
+    if ifd_off + 2 > len(head):
+        raise IOError("IFD beyond fetched header")
+    n_entries = u("H", ifd_off)[0]
+    tags = {}
+    TYPE_SIZE = {1: 1, 2: 1, 3: 2, 4: 4, 5: 8, 12: 8, 16: 8}
+    for i in range(n_entries):
+        off = ifd_off + 2 + i * 12
+        tag, typ, cnt = u("HHI", off)
+        voff = off + 8
+        size = TYPE_SIZE.get(typ, 4) * cnt
+        if size > 4:
+            voff = u("I", off + 8)[0]
+        vals = []
+        if voff + size <= len(head):
+            for k in range(cnt):
+                p = voff + k * TYPE_SIZE.get(typ, 4)
+                if typ == 3:
+                    vals.append(u("H", p)[0])
+                elif typ == 4:
+                    vals.append(u("I", p)[0])
+                elif typ == 12:
+                    vals.append(u("d", p)[0])
+                elif typ == 1:
+                    vals.append(head[p])
+                else:
+                    vals.append(u("I", p)[0])
+        tags[tag] = vals
+
+    def one(tag, default=None):
+        v = tags.get(tag)
+        return v[0] if v else default
+
+    hdr = {
+        "bo": bo,
+        "width":  one(256), "height": one(257),
+        "tile_w": one(322), "tile_h": one(323),
+        "offsets": tags.get(324, []), "counts": tags.get(325, []),
+        "compression": one(259, 1), "predictor": one(317, 1),
+        "scale": tags.get(33550, []), "tiepoint": tags.get(33922, []),
+    }
+    if not hdr["tile_w"] or not hdr["offsets"]:
+        raise IOError("not a tiled COG")
+    if not hdr["scale"] or not hdr["tiepoint"]:
+        raise IOError("missing geotransform")
+    _cog_hdr_cache[url] = hdr
+    return hdr
+
+
+def _cog_tile(url, hdr, ti):
+    """Decode one internal COG tile (uint8 band) via a Range request."""
+    key = (url, ti)
+    if key in _cog_tile_cache:
+        return _cog_tile_cache[key]
+    import zlib as _z
+    raw = _http_range(url, hdr["offsets"][ti], hdr["counts"][ti])
+    comp = hdr["compression"]
+    if comp in (8, 32946):
+        data = _z.decompress(raw)
+    elif comp == 1:
+        data = raw
+    else:
+        raise IOError(f"unsupported TIFF compression {comp}")
+    tw, th = hdr["tile_w"], hdr["tile_h"]
+    arr = np.frombuffer(data[:tw * th], dtype=np.uint8).reshape(th, tw).copy()
+    if hdr["predictor"] == 2:
+        np.cumsum(arr, axis=1, dtype=np.uint8, out=arr)
+    _cog_tile_cache[key] = arr
+    return arr
+
+
+def _lc_sample(url, hdr, lat, lon):
+    """Land-cover class code at a point, or 0 if unavailable."""
+    sx, sy = hdr["scale"][0], hdr["scale"][1]
+    ox, oy = hdr["tiepoint"][3], hdr["tiepoint"][4]
+    px = int((lon - ox) / sx)
+    py = int((oy - lat) / sy)
+    if px < 0 or py < 0 or px >= hdr["width"] or py >= hdr["height"]:
+        return 0
+    tw, th = hdr["tile_w"], hdr["tile_h"]
+    across = (hdr["width"] + tw - 1) // tw
+    ti = (py // th) * across + (px // tw)
+    if ti >= len(hdr["offsets"]):
+        return 0
+    tile = _cog_tile(url, hdr, ti)
+    return int(tile[py % th, px % tw])
+
+
+def fetch_land_cover(coords: list):
+    """
+    Build a land-cover sampler for the area around a route. Returns a function
+    (lat, lon) -> WorldCover class code, or None if the data is unavailable
+    (callers then fall back to OSM-only behaviour).
+    """
+    if not coords:
+        return None
+    os.makedirs(LC_CACHE_DIR, exist_ok=True)
+
+    urls = {}
+    for c in coords[::max(1, len(coords) // 50)]:
+        # coords may carry a 3rd bridge/tunnel element — index, don't unpack
+        u = _esa_tile_url(c[0], c[1])
+        if u not in urls:
             try:
-                req = Request(
-                    f"https://api.open-meteo.com/v1/elevation?latitude={lats}&longitude={lons}",
-                    headers={"User-Agent": "AC-Road-Tool/1.0"})
-                with urlopen(req, timeout=15) as r:
-                    data = json.loads(r.read())
-                elevs = data.get("elevation", [])
-                if not elevs:
-                    return None
-                results.extend(float(e) for e in elevs)
-                break
+                urls[u] = _parse_cog_header(u)
             except Exception as e:
-                if "429" in str(e) and attempt == 1:
-                    print(f"  [open-meteo] rate limited — backing off 5s…")
-                    time.sleep(5.0)
-                    continue
-                print(f"  [open-meteo] {e}")
-                return None
-        if i + BATCH < len(coords):
-            time.sleep(0.2)
-    return results if len(results) == len(coords) else None
+                raise ElevationUnavailable(
+                    f"could not read ESA WorldCover for this area: {e}")
+    if not urls:
+        return None
+    print(f"  [landcover] ESA WorldCover: {len(urls)} tile file(s)")
+
+    def sampler(lat, lon):
+        u = _esa_tile_url(lat, lon)
+        hdr = urls.get(u)
+        if hdr is None:
+            try:
+                hdr = _parse_cog_header(u)
+                urls[u] = hdr
+            except Exception:
+                return 0
+        try:
+            return _lc_sample(u, hdr, lat, lon)
+        except Exception:
+            return 0
+
+    return sampler
+
+
+# Terrain surface material per land-cover class
+LC_MATERIAL = {
+    LC_TREE: "forest", LC_SHRUB: "forest", LC_MANGROVE: "forest",
+    LC_GRASS: "terrain", LC_CROP: "terrain", LC_WETLAND: "terrain",
+    LC_MOSS: "terrain", LC_BUILT: "dirt", LC_BARE: "dirt",
+    LC_SNOW: "dirt", LC_WATER: "water",
+}
+# Classes where trees are scattered when OSM has no vegetation polygon
+LC_TREE_DENSITY = {LC_TREE: 1.0, LC_MANGROVE: 0.8, LC_SHRUB: 0.35}
 
 
 # ─── Road Geometry ────────────────────────────────────────────────────────────
@@ -694,6 +2152,34 @@ GRASS_W    = 10.0   # grass verge width each side
 GRASS_DROP = 0.4    # drop at grass outer edge
 SKIRT_W    = 70.0   # terrain skirt beyond the grass (10m → 80m out)
 SKIRT_DROP = 2.0    # total drop at skirt outer edge
+
+
+def _fix_edge_folds(ex: np.ndarray, ez: np.ndarray,
+                    dxs: np.ndarray, dzs: np.ndarray) -> tuple:
+    """
+    Repair folded offset edges. On a bend tighter than the offset distance
+    the offset polyline reverses direction and crosses itself; in the physics
+    mesh that becomes overlapping/inverted collision triangles — the
+    invisible spikes that launch the car in AC. Points where the edge runs
+    backwards relative to the centreline are re-interpolated from the
+    surrounding healthy points (the edge collapses to a chord there).
+    """
+    vex = np.diff(ex)
+    vez = np.diff(ez)
+    seg_bad = (vex * dxs[:-1] + vez * dzs[:-1]) <= 1e-9
+    if not seg_bad.any():
+        return ex, ez
+    bad = np.zeros(len(ex), dtype=bool)
+    bad[:-1] |= seg_bad
+    bad[1:]  |= seg_bad
+    good = ~bad
+    if good.sum() < 2:
+        return ex, ez
+    idx = np.arange(len(ex), dtype=float)
+    ex = ex.copy(); ez = ez.copy()
+    ex[bad] = np.interp(idx[bad], idx[good], ex[good])
+    ez[bad] = np.interp(idx[bad], idx[good], ez[good])
+    return ex, ez
 
 
 def ground_drop(lateral_from_road_edge: float) -> float:
@@ -719,7 +2205,108 @@ def ground_drop(lateral_from_road_edge: float) -> float:
 
 TERRAIN_MAX_DIST  = 90.0    # how far terrain reaches from the road (m)
 TERRAIN_GRID_STEP = 12.0    # grid node spacing (m)
-TERRAIN_BLEND     = 40.0    # distance over which terrain blends road→DEM (m)
+TERRAIN_BLEND     = 12.0    # distance over which terrain blends road→DEM (m).
+                            # Kept short: a wide blend flattens real cliff
+                            # faces and cuttings beside the road into gentle
+                            # artificial verges. 12 m hides the road/DEM seam
+                            # while letting the real landform show beyond it.
+
+
+def _despike_grid(g: np.ndarray, win: int = 2, k: float = 4.0) -> np.ndarray:
+    """
+    Replace outlier cells with the local median, using a (2*win+1)² window and
+    median absolute deviation as the threshold. MAD is robust: a real ridge
+    raises the whole neighbourhood's median so it survives, while a lone bad
+    pixel stands far off its neighbours and gets flattened. NaNs are filled
+    from the local median too. Returns a new array.
+    """
+    out = g.copy()
+    nX, nZ = g.shape
+    for i in range(nX):
+        for j in range(nZ):
+            c = g[i, j]
+            i0, i1 = max(0, i - win), min(nX, i + win + 1)
+            j0, j1 = max(0, j - win), min(nZ, j + win + 1)
+            nb = g[i0:i1, j0:j1]
+            nb = nb[~np.isnan(nb)]
+            if nb.size < 3:
+                continue
+            med = float(np.median(nb))
+            if np.isnan(c):
+                out[i, j] = med
+                continue
+            mad = float(np.median(np.abs(nb - med)))
+            # 1.5 m floor keeps flat ground (MAD≈0) from flagging every ripple
+            if abs(c - med) > k * max(mad, 1.5):
+                out[i, j] = med
+    return out
+
+
+def _suppress_canopy(node_grid: np.ndarray, node_ids: list, node_latlon: list,
+                     lc_fn, dist: np.ndarray, near: np.ndarray,
+                     ry: np.ndarray, step: float) -> np.ndarray:
+    """
+    Remove phantom terrain peaks caused by tree canopy.
+
+    The DEM is a SURFACE model: over woodland it measures treetops, so a
+    patch of gums stands ~10-20 m above the adjacent bare ground and becomes
+    a hillock in the terrain mesh that does not exist. Gated on ESA
+    WorldCover, every tree-covered node is lowered by a typical canopy
+    height, with the tree mask gaussian-blurred so forest edges ramp instead
+    of step. Two safety properties:
+
+    - Bare ground is never touched (mask is zero there), so real hills and
+      cliffs survive; continuous treed slopes shift down uniformly, keeping
+      their shape (and landing nearer the true ground).
+    - A local-minimum floor stops the subtraction carving craters where the
+      DEM actually resolved ground through sparse canopy: no node may end
+      below the lowest original height in its 5×5 neighbourhood.
+    """
+    if lc_fn is None:
+        return node_grid
+    if _local_dems:
+        # Local DEMs (ELVIS LiDAR) are bare-earth ground models — there is no
+        # canopy in the data, so subtracting one would carve real terrain.
+        print("  [terrain] canopy suppression skipped: local ground DEM active")
+        return node_grid
+    CANOPY_TYP = 12.0
+    from scipy.ndimage import gaussian_filter, minimum_filter, maximum_filter
+
+    tree_classes = {LC_TREE, LC_MANGROVE}
+    mask = np.zeros(node_grid.shape, dtype=float)
+    known = np.zeros(node_grid.shape, dtype=bool)
+    for (i, j), (la, lo) in zip(node_ids, node_latlon):
+        known[i, j] = True
+        try:
+            if lc_fn(la, lo) in tree_classes:
+                mask[i, j] = 1.0
+        except Exception:
+            pass
+    if not mask.any():
+        return node_grid
+
+    # Dilate then blur: edge canopy cells must receive the FULL correction
+    # (a blurred-only mask leaves a tall rim around every patch); the blur
+    # spills partial correction onto adjacent bare cells, where the bare
+    # floor below cancels it.
+    mask_s = gaussian_filter(maximum_filter(mask, size=3), sigma=1.0)
+    # Floor from BARE ground only: where the DEM resolved actual ground
+    # nearby, don't carve below it. Inside continuous forest there is no
+    # bare reference, and the full subtraction applies.
+    bare_h = np.where(known & (mask == 0.0) & ~np.isnan(node_grid),
+                      node_grid, np.inf)
+    wmin = minimum_filter(bare_h, size=5) - 1.0
+
+    out = node_grid - CANOPY_TYP * mask_s
+    out = np.maximum(out, np.where(np.isfinite(wmin), wmin, -np.inf))
+    out = np.where(np.isnan(node_grid), node_grid, out)
+
+    changed = int(((node_grid - out) > 0.5).sum())
+    if changed:
+        drop = float(np.nanmax(node_grid - out))
+        print(f"  [terrain] canopy suppression: lowered {changed} tree-covered "
+              f"node(s) by up to {drop:.1f} m")
+    return out
 
 
 def fetch_terrain_grid(mesh: dict) -> dict:
@@ -783,15 +2370,28 @@ def fetch_terrain_grid(mesh: dict) -> dict:
     print(f"  [terrain] sampling {len(query)} DEM points "
           f"({n_ref} road refs + {len(node_latlon)} grid nodes, "
           f"{nX}×{nZ} grid)…")
-    elevs = fetch_elevations(query, prefer_openmeteo=True)
-    if elevs is None:
-        print("  [terrain] elevation APIs unavailable — flat skirt fallback")
-        return None
+    elevs = fetch_elevations(query)
 
     dem_ref = np.array(elevs[:n_ref], dtype=float)
-    dem_node = {}
+
+    # ── De-spike the sampled lattice ──
+    # Raw DEM tiles carry isolated bad pixels that become vertical spikes in
+    # the mesh. A 5×5 MEDIAN + MAD filter removes them while preserving real
+    # ridges and canyons — unlike a Gaussian blur, which flattens genuine
+    # terrain along with the noise.
+    node_grid = np.full((nX, nZ), np.nan)
     for k, (i, j) in enumerate(node_ids):
-        dem_node[(i, j)] = float(elevs[n_ref + k])
+        node_grid[i, j] = float(elevs[n_ref + k])
+    node_grid = _despike_grid(node_grid)
+    node_grid = _suppress_canopy(node_grid, node_ids, node_latlon,
+                                 mesh.get("land_cover"), dist, near, ry,
+                                 TERRAIN_GRID_STEP)
+
+    dem_node = {}
+    for (i, j) in node_ids:
+        v = node_grid[i, j]
+        if not np.isnan(v):
+            dem_node[(i, j)] = float(v)
 
     return {
         "gx": gx, "gz": gz, "nX": nX, "nZ": nZ,
@@ -809,6 +2409,8 @@ def build_terrain_meshes(mesh: dict, grid: dict) -> list:
     DEM shape over TERRAIN_BLEND metres. Returns
     [(name, kn5_verts, indices, "terrain")].
     """
+    lc = mesh.get("land_cover")
+    inv_ll = mesh.get("to_latlon")
     from scipy.spatial import Delaunay, cKDTree
 
     hw = mesh["stats"]["road_width"] / 2.0
@@ -828,6 +2430,7 @@ def build_terrain_meshes(mesh: dict, grid: dict) -> list:
     # polyline cuts corners and underestimates closeness on curves — which
     # otherwise lets terrain spill onto the road on bends).
     cl_xz = np.array([[p[0], p[2]] for p in mesh["centerline"]])
+    cl_y  = np.array([p[1] for p in mesh["centerline"]])
     kd_cl = cKDTree(cl_xz)
 
     # ── Exterior grid nodes (outside the road corridor), conformed height ──
@@ -887,12 +2490,38 @@ def build_terrain_meshes(mesh: dict, grid: dict) -> list:
                 cxp = ox0 + vx / vl * hw
                 czp = oz0 + vz / vl * hw
             pts.append((cxp, czp))
-            ys.append(ry[i] - g_drop)
+            # Height from the NEAREST centreline point, not this collar
+            # point's own ref: on a hairpin the clamp above can move the
+            # point next to a different stretch of road, and keeping the
+            # ref height would leave a vertical lip at the road edge.
+            ys.append(float(cl_y[ci]) - g_drop)
 
     if len(pts) < 3:
         return []
     pts = np.array(pts, dtype=float)
     ys  = np.array(ys, dtype=float)
+
+    # ── Level water surfaces ──
+    # DEM over water is noisy, so classified water would otherwise be a bumpy
+    # sheet. Each water point takes the MEDIAN of nearby water points: that
+    # kills the ripple, but unlike flattening a whole body to one height it
+    # still lets a river run downhill.
+    if lc is not None and inv_ll is not None:
+        wmask = np.zeros(len(pts), dtype=bool)
+        for i, (px_, pz_) in enumerate(pts):
+            la, lo = inv_ll(float(px_), float(pz_))
+            if lc(la, lo) == LC_WATER:
+                wmask[i] = True
+        widx = np.nonzero(wmask)[0]
+        if len(widx) >= 3:
+            wkd = cKDTree(pts[widx])
+            neigh = wkd.query_ball_point(pts[widx], r=TERRAIN_GRID_STEP * 5.0)
+            levelled = ys[widx].copy()
+            for a, nb in enumerate(neigh):
+                if len(nb) >= 3:
+                    levelled[a] = float(np.median(ys[widx][nb]))
+            ys[widx] = levelled
+            print(f"  [terrain] levelled {len(widx)} water points")
     pos = np.column_stack([pts[:, 0], ys, pts[:, 1]])   # (N,3) world xyz
 
     tri = Delaunay(pts)
@@ -930,20 +2559,29 @@ def build_terrain_meshes(mesh: dict, grid: dict) -> list:
     ln[ln == 0] = 1.0
     nrm = nrm / ln[:, None]
 
-    # ── Emit triangles, chunked under the KN5 65k-vertex limit ──
+    # ── Emit triangles, grouped by land-cover surface, chunked under the KN5
+    #    65k-vertex limit. Each triangle takes the material of its centroid's
+    #    WorldCover class, so forest floor, bare ground and water read
+    #    differently instead of one uniform green.
     out = []
-    part = 0
-    verts, idx, vmap = [], [], {}
+    groups = {}          # material -> [verts, idx, vmap, part]
 
-    def flush():
-        nonlocal verts, idx, vmap, part
+    def group(matkey):
+        if matkey not in groups:
+            groups[matkey] = [[], [], {}, 0]
+        return groups[matkey]
+
+    def flush(matkey):
+        verts, idx, vmap, part = groups[matkey]
         if verts:
-            name = "1GRASS_TER" if part == 0 else f"1GRASS_TER_{part}"
-            out.append((name, verts, idx, "terrain"))
-            part += 1
-        verts, idx, vmap = [], [], {}
+            suffix = "" if matkey == "terrain" else f"_{matkey.upper()}"
+            n = part
+            name = f"1GRASS_TER{suffix}" if n == 0 else f"1GRASS_TER{suffix}_{n}"
+            out.append((name, verts, idx, matkey))
+            groups[matkey] = [[], [], {}, part + 1]
 
-    def vid(k):
+    def vid(g, k):
+        verts, idx, vmap, _ = g
         vi = vmap.get(k)
         if vi is None:
             x, y, z = pos[k]
@@ -957,16 +2595,25 @@ def build_terrain_meshes(mesh: dict, grid: dict) -> list:
         return vi
 
     for s in keep:
-        if len(verts) + 3 > 60000:
-            flush()
         p0, p1, p2 = pos[s]
+        matkey = "terrain"
+        if lc is not None and inv_ll is not None:
+            cx, cz = float((p0[0] + p1[0] + p2[0]) / 3.0), \
+                     float((p0[2] + p1[2] + p2[2]) / 3.0)
+            la, lo = inv_ll(cx, cz)
+            matkey = LC_MATERIAL.get(lc(la, lo), "terrain")
+        g = group(matkey)
+        if len(g[0]) + 3 > 60000:
+            flush(matkey)
+            g = group(matkey)
         gy = np.cross(p1 - p0, p2 - p0)[1]     # up-facing winding
         a, b, c = int(s[0]), int(s[1]), int(s[2])
         if gy >= 0:
-            idx.extend((vid(a), vid(b), vid(c)))
+            g[1].extend((vid(g, a), vid(g, b), vid(g, c)))
         else:
-            idx.extend((vid(a), vid(c), vid(b)))
-    flush()
+            g[1].extend((vid(g, a), vid(g, c), vid(g, b)))
+    for matkey in list(groups):
+        flush(matkey)
 
     return out
 
@@ -1026,11 +2673,14 @@ def process_road(coords: list, road_width: float = 8.0,
         xs, zs = x_rs, z_rs
 
     # ── Smooth elevation ──
-    # SRTM data is ~30m resolution with ±1-2m noise, so a Gaussian with
-    # sigma ≈ 30m removes quantisation steps without flattening real
-    # gradients (nothing under 30m is real data anyway). Gaussian (not
-    # boxcar) => continuous slope => no felt "kinks" at speed.
-    sigma_m = 30.0
+    # Sigma scaled to the data source. SRTM-era tiles are ~30m resolution
+    # with ±1-2m noise, so sigma ≈ 30m removes quantisation steps without
+    # flattening real gradients (nothing under 30m is real data anyway).
+    # LiDAR has no such steps — heavy smoothing there only erases real
+    # crests and compressions — so the profile carries its own sigma
+    # (8m for local high-res DEMs). Gaussian (not boxcar) => continuous
+    # slope => no felt "kinks" at speed.
+    sigma_m = float(elev_profile.get("smooth_sigma", 30.0)) if elev_profile else 30.0
     ys = np.array(gaussian_filter1d(y_rs, sigma=sigma_m, mode='nearest'))
 
     # Centre at road start (origin = road start)
@@ -1049,15 +2699,53 @@ def process_road(coords: list, road_width: float = 8.0,
     # verge drop scales with verge width (a 0.5m verge shouldn't be a cliff);
     # at grass_width=0 the drop is 0, so terrain meets the road edge flush.
     g_drop = GRASS_DROP * (grass_width / GRASS_W) if GRASS_W else 0.0
-    lx = xs + nx*hw;  lz = zs + nz*hw
-    rx = xs - nx*hw;  rz = zs - nz*hw
-    # Grass outer edges
-    glx = xs + nx*(hw+gw);  glz = zs + nz*(hw+gw)  # left grass outer
-    grx = xs - nx*(hw+gw);  grz = zs - nz*(hw+gw)  # right grass outer
-    # Terrain skirt outer edges (grass outer → 80m from road)
+
+    # ── Curvature-aware offsets ──
+    # An offset placed at or beyond the local centre of curvature folds the
+    # edge back across itself; the folded quads become inverted, overlapping
+    # collision triangles — the invisible spikes that launch/flip the car in
+    # AC. Cap every inside-of-bend offset at 90% of the distance to the
+    # curvature centre, so the road narrows slightly through impossibly
+    # tight bends instead of folding.
+    from scipy.ndimage import maximum_filter1d
+    dx2 = np.gradient(dxs); dz2 = np.gradient(dzs)
+    k_s = (dxs * dz2 - dzs * dx2) / (lengths_xz ** 3)
+    # Windowed MAXIMUM curvature per side (±7m at 1m spacing): conservative —
+    # a smoothed average would underestimate the apex and let the edge fold.
+    k_left  = maximum_filter1d(np.maximum(k_s,  0.0), size=15)   # centre on +n
+    k_right = maximum_filter1d(np.maximum(-k_s, 0.0), size=15)   # centre on -n
+
+    def _safe_offsets(offset):
+        """(left, right) offset distances, clamped on the inside of bends."""
+        d_l = np.full(n_pts, float(offset))
+        d_r = np.full(n_pts, float(offset))
+        pos = k_left  > 1e-6
+        neg = k_right > 1e-6
+        d_l[pos] = np.minimum(offset, 0.9 / k_left[pos])
+        d_r[neg] = np.minimum(offset, 0.9 / k_right[neg])
+        return d_l, d_r
+
     sw = gw + SKIRT_W
-    slx_ = xs + nx*(hw+sw);  slz_ = zs + nz*(hw+sw)
-    srx_ = xs - nx*(hw+sw);  srz_ = zs - nz*(hw+sw)
+    dl_rd, dr_rd = _safe_offsets(hw)
+    dl_g,  dr_g  = _safe_offsets(hw + gw)
+    dl_s,  dr_s  = _safe_offsets(hw + sw)
+    lx = xs + nx*dl_rd;  lz = zs + nz*dl_rd
+    rx = xs - nx*dr_rd;  rz = zs - nz*dr_rd
+    # Grass outer edges
+    glx = xs + nx*dl_g;  glz = zs + nz*dl_g   # left grass outer
+    grx = xs - nx*dr_g;  grz = zs - nz*dr_g   # right grass outer
+    # Terrain skirt outer edges (grass outer → 80m from road)
+    slx_ = xs + nx*dl_s;  slz_ = zs + nz*dl_s
+    srx_ = xs - nx*dr_s;  srz_ = zs - nz*dr_s
+
+    # Safety net: repair any residual fold (e.g. a stitching kink sharper
+    # than the curvature estimate resolves).
+    lx,   lz   = _fix_edge_folds(lx,   lz,   dxs, dzs)
+    rx,   rz   = _fix_edge_folds(rx,   rz,   dxs, dzs)
+    glx,  glz  = _fix_edge_folds(glx,  glz,  dxs, dzs)
+    grx,  grz  = _fix_edge_folds(grx,  grz,  dxs, dzs)
+    slx_, slz_ = _fix_edge_folds(slx_, slz_, dxs, dzs)
+    srx_, srz_ = _fix_edge_folds(srx_, srz_, dxs, dzs)
 
     # Build road mesh
     vertices, uvs, faces = [], [], []
@@ -1073,24 +2761,29 @@ def process_road(coords: list, road_width: float = 8.0,
         faces.append((a+1, d+1, b+1, a+1, d+1, b+1))
         faces.append((a+1, c+1, d+1, a+1, c+1, d+1))
 
-    # Build grass vertices (left and right strips)
+    # Build grass vertices (left and right strips).
+    # SKIPPED entirely when grass_width is 0 (the real-terrain export path):
+    # zero-width strips are degenerate zero-area PHYSICAL collision triangles
+    # coincident with the road edges — in AC these behave as invisible spikes
+    # that flip the car.
     grass_l_verts = []
     grass_r_verts = []
     grass_uvs = []
     grass_l_faces = []
     grass_r_faces = []
 
-    for i in range(n_pts):
-        uc = i / (n_pts-1) * total_length * ts
-        oy = float(ys[i]) - g_drop          # outer edge blends downward
-        # Left grass: road left edge → grass outer left
-        grass_l_verts.append((lx[i],  float(ys[i]), lz[i]))
-        grass_l_verts.append((glx[i], oy,           glz[i]))
-        # Right grass: road right edge → grass outer right
-        grass_r_verts.append((rx[i],  float(ys[i]), rz[i]))
-        grass_r_verts.append((grx[i], oy,           grz[i]))
-        grass_uvs.append((0.0, uc))
-        grass_uvs.append((1.0, uc))
+    if gw > 0:
+        for i in range(n_pts):
+            uc = i / (n_pts-1) * total_length * ts
+            oy = float(ys[i]) - g_drop      # outer edge blends downward
+            # Left grass: road left edge → grass outer left
+            grass_l_verts.append((lx[i],  float(ys[i]), lz[i]))
+            grass_l_verts.append((glx[i], oy,           glz[i]))
+            # Right grass: road right edge → grass outer right
+            grass_r_verts.append((rx[i],  float(ys[i]), rz[i]))
+            grass_r_verts.append((grx[i], oy,           grz[i]))
+            grass_uvs.append((0.0, uc))
+            grass_uvs.append((1.0, uc))
 
     # Terrain skirt strips: grass outer edge → 80m out, dropping to -2m.
     # Gives the surroundings (buildings/trees) ground to stand on and
@@ -1108,16 +2801,16 @@ def process_road(coords: list, road_width: float = 8.0,
         skirt_uvs.append((0.0, uc))
         skirt_uvs.append((1.0, uc))
 
-    for i in range(n_pts - 1):
-        a,b,c,d = i*2, i*2+1, i*2+2, i*2+3
-        grass_l_faces.append((a+1, d+1, b+1, a+1, d+1, b+1))
-        grass_l_faces.append((a+1, c+1, d+1, a+1, c+1, d+1))
-        grass_r_faces.append((a+1, d+1, b+1, a+1, d+1, b+1))
-        grass_r_faces.append((a+1, c+1, d+1, a+1, c+1, d+1))
+    if gw > 0:
+        for i in range(n_pts - 1):
+            a,b,c,d = i*2, i*2+1, i*2+2, i*2+3
+            grass_l_faces.append((a+1, d+1, b+1, a+1, d+1, b+1))
+            grass_l_faces.append((a+1, c+1, d+1, a+1, c+1, d+1))
+            grass_r_faces.append((a+1, d+1, b+1, a+1, d+1, b+1))
+            grass_r_faces.append((a+1, c+1, d+1, a+1, c+1, d+1))
 
-    # Stats
-    dx2 = np.gradient(dxs); dz2 = np.gradient(dzs)
-    curv = np.abs(dxs*dz2 - dzs*dx2) / (lengths_xz**3 + 1e-9)
+    # Stats (dx2/dz2 computed above for the curvature clamp)
+    curv = np.abs(k_s)
     mc   = float(np.percentile(curv, 99))
     corners = int(np.sum(np.diff((curv > mc*0.15).astype(int)) > 0))
     dys = np.diff(ys)
@@ -1263,6 +2956,10 @@ def build_obj(mesh: dict, track_name: str) -> tuple:
     base_v = len(verts) + 1
     base_vt = len(uvs_raw) + 1
 
+    if not grass_l_verts:
+        obj_content = "\n".join(lines)
+        return obj_content, _build_mtl()
+
     # Left grass
     lines.append("o 1GRASS_L")
     for v in grass_l_verts:
@@ -1311,8 +3008,11 @@ def build_obj(mesh: dict, track_name: str) -> tuple:
     # from the node transform — so empties must be created in Blender.
 
     obj_content = "\n".join(lines)
+    return obj_content, _build_mtl()
 
-    mtl_content = (
+
+def _build_mtl() -> str:
+    return (
         "# AC Road Tool\n"
         "newmtl road\n"
         "Ka 0.2 0.2 0.2\n"
@@ -1330,8 +3030,6 @@ def build_obj(mesh: dict, track_name: str) -> tuple:
         "illum 1\n"
         "map_Kd grass.png\n"
     )
-
-    return obj_content, mtl_content
 
 
 
@@ -1425,25 +3123,99 @@ def build_grass_texture(size: int = 128) -> bytes:
 
 
 def build_building_texture(size: int = 128) -> bytes:
-    """Light render/plaster with faint horizontal floor lines + window grid."""
+    """Cream weatherboard house wall: board lines + one sparse window row.
+    The old dense office window grid is most of why buildings read as
+    industrial blocks instead of houses."""
     rng = np.random.default_rng(11)
-    noise = rng.integers(-7, 7, size=(size, size, 1))
-    base = np.full((size, size, 3), (176, 170, 160), dtype=np.int16) + noise
+    noise = rng.integers(-5, 5, size=(size, size, 1))
+    base = np.full((size, size, 3), (214, 206, 190), dtype=np.int16) + noise
     img = np.clip(base, 0, 255).astype(np.uint8)
-    # window grid (dark rectangles)
-    step = size // 4
-    for wy in range(step // 3, size, step):
-        for wx in range(step // 3, size, step):
-            img[wy:wy + step // 3, wx:wx + step // 3, :] = (72, 82, 95)
+    for by in range(0, size, 10):                     # weatherboard lines
+        img[by:by+1, :, :] = np.clip(img[by:by+1, :, :].astype(int) - 18, 0, 255)
+    # one row of house windows, mid-wall, widely spaced, with frames
+    wy0, wh, ww, step = size//2 - 11, 22, 16, 44
+    for wx in range(10, size - ww, step):
+        img[wy0-2:wy0+wh+2, wx-2:wx+ww+2, :] = (236, 232, 224)   # frame
+        img[wy0:wy0+wh, wx:wx+ww, :] = (62, 76, 92)              # glass
+        img[wy0+wh//2:wy0+wh//2+2, wx:wx+ww, :] = (236, 232, 224)  # sash
+    return _png_encode(size, size, img.tobytes())
+
+
+def build_building2_texture(size: int = 128) -> bytes:
+    """Red-brick house wall variant with the same sparse window row."""
+    rng = np.random.default_rng(29)
+    noise = rng.integers(-10, 10, size=(size, size, 1))
+    base = np.full((size, size, 3), (158, 106, 84), dtype=np.int16) + noise
+    img = np.clip(base, 0, 255).astype(np.uint8)
+    for by in range(0, size, 6):                      # mortar courses
+        img[by:by+1, :, :] = np.clip(img[by:by+1, :, :].astype(int) + 22, 0, 255)
+    wy0, wh, ww, step = size//2 - 11, 22, 16, 44
+    for wx in range(10, size - ww, step):
+        img[wy0-2:wy0+wh+2, wx-2:wx+ww+2, :] = (228, 222, 210)
+        img[wy0:wy0+wh, wx:wx+ww, :] = (56, 70, 86)
+        img[wy0+wh//2:wy0+wh//2+2, wx:wx+ww, :] = (228, 222, 210)
+    return _png_encode(size, size, img.tobytes())
+
+
+def build_tree2_texture(size: int = 64) -> bytes:
+    """Dark olive conifer canopy, same two-octave clumping."""
+    rng = np.random.default_rng(41)
+    coarse = np.kron(rng.integers(-20, 20, size=(8, 8, 1)), np.ones((8, 8, 1)))
+    fine = rng.integers(-12, 12, size=(size, size, 1))
+    base = np.full((size, size, 3), (48, 70, 42), dtype=np.int16) + coarse + fine
+    return _png_encode(size, size, np.clip(base, 0, 255).astype(np.uint8).tobytes())
+
+
+def build_asphalt_texture(size: int = 128) -> bytes:
+    """Plain unmarked asphalt for adjacent roads (no centre/edge lines)."""
+    rng = np.random.default_rng(97)
+    noise = rng.integers(-8, 8, size=(size, size, 1))
+    base = np.full((size, size, 3), (62, 62, 65), dtype=np.int16) + noise
+    return _png_encode(size, size, np.clip(base, 0, 255).astype(np.uint8).tobytes())
+
+
+def build_roof_texture(size: int = 64) -> bytes:
+    """Muted terracotta tile — houses, not warehouses. Faint course lines."""
+    rng = np.random.default_rng(83)
+    noise = rng.integers(-12, 12, size=(size, size, 1))
+    base = np.full((size, size, 3), (164, 92, 68), dtype=np.int16) + noise
+    img = np.clip(base, 0, 255).astype(np.uint8)
+    for by in range(0, size, 8):
+        img[by:by+1, :, :] = np.clip(img[by:by+1, :, :].astype(int) - 20, 0, 255)
     return _png_encode(size, size, img.tobytes())
 
 
 def build_tree_texture(size: int = 64) -> bytes:
+    """Mid-green broadleaf canopy: coarse foliage clumps over fine leaf
+    noise — flat single-octave noise is what made trees look cartoony."""
     rng = np.random.default_rng(23)
-    noise = rng.integers(-18, 18, size=(size, size, 1))
-    base = np.full((size, size, 3), (44, 84, 38), dtype=np.int16) + noise
-    img = np.clip(base, 0, 255).astype(np.uint8)
-    return _png_encode(size, size, img.tobytes())
+    coarse = np.kron(rng.integers(-26, 26, size=(8, 8, 1)), np.ones((8, 8, 1)))
+    fine = rng.integers(-10, 10, size=(size, size, 1))
+    base = np.full((size, size, 3), (74, 104, 56), dtype=np.int16) + coarse + fine
+    return _png_encode(size, size, np.clip(base, 0, 255).astype(np.uint8).tobytes())
+
+
+def build_forest_texture(size: int = 128) -> bytes:
+    """Dark leaf-litter floor for tree-covered ground."""
+    rng = np.random.default_rng(41)
+    noise = rng.integers(-16, 16, size=(size, size, 1))
+    base = np.full((size, size, 3), (48, 66, 38), dtype=np.int16) + noise
+    return _png_encode(size, size, np.clip(base, 0, 255).astype(np.uint8).tobytes())
+
+
+def build_dirt_texture(size: int = 128) -> bytes:
+    """Bare / built-up ground: dry earth."""
+    rng = np.random.default_rng(53)
+    noise = rng.integers(-14, 14, size=(size, size, 1))
+    base = np.full((size, size, 3), (134, 112, 86), dtype=np.int16) + noise
+    return _png_encode(size, size, np.clip(base, 0, 255).astype(np.uint8).tobytes())
+
+
+def build_water_texture(size: int = 128) -> bytes:
+    rng = np.random.default_rng(67)
+    noise = rng.integers(-8, 8, size=(size, size, 1))
+    base = np.full((size, size, 3), (46, 78, 112), dtype=np.int16) + noise
+    return _png_encode(size, size, np.clip(base, 0, 255).astype(np.uint8).tobytes())
 
 
 def build_terrain_texture(size: int = 128) -> bytes:
@@ -1633,10 +3405,13 @@ def _strip_to_kn5_verts(pairs_flat, uvs, centerline):
         nx = fwd[1]*lat[2] - fwd[2]*lat[1]
         ny = fwd[2]*lat[0] - fwd[0]*lat[2]
         nz = fwd[0]*lat[1] - fwd[1]*lat[0]
-        nl = math.sqrt(nx*nx + ny*ny + nz*nz) or 1.0
-        nx, ny, nz = nx/nl, ny/nl, nz/nl
-        if ny < 0:
-            nx, ny, nz = -nx, -ny, -nz
+        nl = math.sqrt(nx*nx + ny*ny + nz*nz)
+        if nl < 1e-9:
+            nx, ny, nz = 0.0, 1.0, 0.0   # degenerate lateral → default up
+        else:
+            nx, ny, nz = nx/nl, ny/nl, nz/nl
+            if ny < 0:
+                nx, ny, nz = -nx, -ny, -nz
         for v, u in ((a, uvs[2*i]), (b, uvs[2*i+1])):
             verts.append(((v[0], v[1], v[2]), (nx, ny, nz), u, fwd))
 
@@ -1697,7 +3472,14 @@ def build_kn5(mesh: dict, track_name: str, env_meshes: list = None,
                 ("grass.png",    build_grass_texture()),
                 ("building.png", build_building_texture()),
                 ("tree.png",     build_tree_texture()),
-                ("terrain.png",  build_terrain_texture())]
+                ("terrain.png",  build_terrain_texture()),
+                ("forest.png",   build_forest_texture()),
+                ("dirt.png",     build_dirt_texture()),
+                ("water.png",    build_water_texture()),
+                ("roof.png",      build_roof_texture()),
+                ("asphalt.png",   build_asphalt_texture()),
+                ("building2.png", build_building2_texture()),
+                ("tree2.png",     build_tree2_texture())]
     k.i32(len(textures))
     for tex_name, data in textures:
         k.i32(1)                               # active
@@ -1705,13 +3487,22 @@ def build_kn5(mesh: dict, track_name: str, env_meshes: list = None,
         k.blob(data)
 
     # ── Materials ──
-    mat_ids = {"road": 0, "grass": 1, "building": 2, "tree": 3, "terrain": 4}
-    k.i32(5)
+    mat_ids = {"road": 0, "grass": 1, "building": 2, "tree": 3, "terrain": 4,
+               "forest": 5, "dirt": 6, "water": 7, "roof": 8, "asphalt": 9,
+               "building2": 10, "tree2": 11}
+    k.i32(12)
     k.material("road",     "ksPerPixel", "road.png",     specular=0.08, spec_exp=30.0)
     k.material("grass",    "ksPerPixel", "grass.png",    specular=0.01, spec_exp=5.0)
     k.material("building", "ksPerPixel", "building.png", specular=0.03, spec_exp=10.0)
     k.material("tree",     "ksPerPixel", "tree.png",     specular=0.01, spec_exp=5.0)
     k.material("terrain",  "ksPerPixel", "terrain.png",  specular=0.01, spec_exp=5.0)
+    k.material("forest",   "ksPerPixel", "forest.png",   specular=0.01, spec_exp=5.0)
+    k.material("dirt",     "ksPerPixel", "dirt.png",     specular=0.01, spec_exp=5.0)
+    k.material("water",    "ksPerPixel", "water.png",    specular=0.30, spec_exp=60.0)
+    k.material("roof",     "ksPerPixel", "roof.png",     specular=0.02, spec_exp=8.0)
+    k.material("asphalt",  "ksPerPixel", "asphalt.png",  specular=0.06, spec_exp=25.0)
+    k.material("building2","ksPerPixel", "building2.png",specular=0.03, spec_exp=10.0)
+    k.material("tree2",    "ksPerPixel", "tree2.png",    specular=0.01, spec_exp=5.0)
 
     # ── Geometry ──
     cl = mesh["centerline"]
@@ -1720,7 +3511,11 @@ def build_kn5(mesh: dict, track_name: str, env_meshes: list = None,
     def add_strip(base_name, vs_key_or_list, uvs_list, mat_id):
         vs_all = mesh[vs_key_or_list] if isinstance(vs_key_or_list, str) else vs_key_or_list
         out = []
+        if len(vs_all) < 4:            # fewer than 2 pairs = no quads
+            return out
         for name, vs, us, sub_cl in _chunk_strip(vs_all, uvs_list, cl, base_name):
+            if len(vs) < 4:
+                continue
             kv, flip = _strip_to_kn5_verts(vs, us, sub_cl)
             out.append((name, kv, _strip_indices(len(kv)//2, flip), mat_id))
         return out
@@ -2006,43 +3801,62 @@ extras/ contains an optional Blender workflow for customisation.
 def export_ac_package(coords: list, road_width: float,
                       smooth_factor: float, track_name: str,
                       install_path: str = None,
-                      include_env: bool = True) -> dict:
+                      include_env: bool = True,
+                      max_grade: float = None,
+                      monotonic: bool = False) -> dict:
+    # Elevation and land cover are required, not optional. If they can't be
+    # obtained the export fails with the reason — a flat or untextured track
+    # looks plausible but is wrong, which is worse than a clear failure.
     print(f"  [export] Fetching elevation profile…")
-    elev_profile = fetch_elevation_profile(coords)
-    print(f"  [export] Elevation {'OK' if elev_profile else 'flat'}")
+    try:
+        elev_profile = fetch_elevation_profile(coords, max_grade=max_grade,
+                                               monotonic=monotonic)
+    except ElevationUnavailable as e:
+        return {"error": f"Elevation unavailable — {e}"}
+    if not elev_profile:
+        return {"error": "Elevation unavailable — no profile could be built "
+                         "for this road."}
+    print(f"  [export] Elevation OK")
 
-    # When real terrain will be laid, drop the wide grass verge so the terrain
-    # meets the road edge directly; when it won't, keep the 10m grass verge.
-    # Elevation availability predicts terrain; if it turns out unavailable we
-    # rebuild the road mesh with the full verge restored.
-    grass_w = 0.0 if elev_profile else GRASS_W
+    # Terrain runs to the road edge, so no wide grass verge is needed.
     mesh = process_road(coords, road_width, smooth_factor,
-                        elev_profile=elev_profile, grass_width=grass_w)
+                        elev_profile=elev_profile, grass_width=0.0)
     if "error" in mesh:
         return mesh
 
-    # ── Real terrain beside the road (cliffs, valleys, hillsides) ──
-    terrain_meshes = None
-    ground_pts = None
-    if elev_profile:
-        try:
-            tgrid = fetch_terrain_grid(mesh)
-            if tgrid:
-                terrain_meshes = build_terrain_meshes(mesh, tgrid)
-                ground_pts = [v[0] for _, kv, _, _ in terrain_meshes for v in kv]
-                ground_pts += list(mesh["centerline"])
-                print(f"  [export] Real terrain: "
-                      f"{sum(len(kv) for _, kv, _, _ in terrain_meshes)} verts")
-        except Exception as e:
-            print(f"  [export] Terrain grid skipped: {e}")
+    # ── Land cover (ESA WorldCover): surface type + vegetation everywhere,
+    #    including where OpenStreetMap has no polygons drawn. ──
+    try:
+        lc = fetch_land_cover(coords)
+    except Exception as e:
+        return {"error": f"Land cover unavailable — {e}"}
+    if lc is None:
+        return {"error": "Land cover unavailable — ESA WorldCover could not "
+                         "be read for this area."}
+    pp = mesh["proj"]
+    _inv = Transformer.from_crs(
+        f"+proj=tmerc +lat_0={pp['mid_lat']} +lon_0={pp['mid_lon']} +units=m",
+        "EPSG:4326", always_xy=True)
+    _ox, _oz = pp["ox"], pp["oz"]
 
-    # Terrain didn't materialise despite having elevation — restore the wide
-    # grass verge (the road-edge grass was only to make room for terrain).
-    if elev_profile and not terrain_meshes:
-        print("  [export] No terrain built — restoring 10m grass verge")
-        mesh = process_road(coords, road_width, smooth_factor,
-                            elev_profile=elev_profile, grass_width=GRASS_W)
-        ground_pts = None
+    def _to_latlon(x, z):
+        lon, lat = _inv.transform(x + _ox, -(z + _oz))
+        return lat, lon
+    mesh["land_cover"] = lc
+    mesh["to_latlon"] = _to_latlon
+
+    # ── Real terrain beside the road (cliffs, valleys, hillsides) ──
+    try:
+        tgrid = fetch_terrain_grid(mesh)
+        terrain_meshes = build_terrain_meshes(mesh, tgrid)
+    except ElevationUnavailable as e:
+        return {"error": f"Terrain elevation unavailable — {e}"}
+    if not terrain_meshes:
+        return {"error": "Terrain could not be built for this road."}
+    ground_pts = [v[0] for _, kv, _, _ in terrain_meshes for v in kv]
+    ground_pts += list(mesh["centerline"])
+    print(f"  [export] Real terrain: "
+          f"{sum(len(kv) for _, kv, _, _ in terrain_meshes)} verts")
 
     env_meshes = None
     n_bldg = n_tree = 0
@@ -2056,6 +3870,10 @@ def export_ac_package(coords: list, road_width: float,
             n_tree = env["n_trees"]
             print(f"  [export] Environment: {n_bldg} buildings, {n_tree} trees "
                   f"(incl. forest scatter)")
+        except IOError as e:
+            # Overpass fully unavailable: fail the export with a retryable
+            # message rather than shipping a silently barren track.
+            return {"error": str(e)}
         except Exception as e:
             print(f"  [export] Surroundings skipped: {e}")
 
@@ -2104,6 +3922,9 @@ def export_ac_package(coords: list, road_width: float,
             print(f"  [export] Direct install failed: {e}")
 
     profile = mesh["elevation_profile"]
+    raw = elev_profile.get("raw_elevs") or []
+    unc = elev_profile.get("uncert") or []
+    pmin = min(elev_profile["elevs"]) if elev_profile.get("elevs") else 0.0
     return {
         "stats":             stats,
         "filename":          f"{track_name}.zip",
@@ -2114,6 +3935,14 @@ def export_ac_package(coords: list, road_width: float,
         "installed_to":      installed_to,
         "install_error":     install_error,
         "elevation_profile": profile[::max(1, len(profile)//500)],
+        "elevation_raw":     [round(v - pmin, 2)
+                              for v in raw[::max(1, len(raw)//500)]],
+        "elevation_unc":     [round(v, 2)
+                              for v in unc[::max(1, len(unc)//500)]],
+        "sidehill_frac":     round(elev_profile.get("sidehill_frac", 0), 3),
+        "uncert_med":        round(elev_profile.get("uncert_med", 0), 1),
+        "dem_mode":          elev_profile.get("dem_mode", "auto"),
+        "dem_coverage":      round(elev_profile.get("dem_coverage", 0.0), 3),
     }
 
 
@@ -2169,6 +3998,12 @@ class Handler(BaseHTTPRequestHandler):
             q = qs.get("q", [""])[0]
             self.send_json(search_osm_roads(q) if q else {"error": "No query"})
 
+        elif parsed.path == "/api/dem_status":
+            try:
+                self.send_json(dem_status())
+            except Exception as e:
+                self.send_json({"mode": "auto", "dems": [],
+                                "error": str(e)})
         elif parsed.path == "/api/geometry":
             t = qs.get("type", [""])[0]
             i = qs.get("id",   [""])[0]
@@ -2200,25 +4035,74 @@ class Handler(BaseHTTPRequestHandler):
                             if c.isalnum() or c == "_")[:32]
             install_path = body.get("install_path") or None
             include_env  = bool(body.get("include_env", True))
+            mg_raw = body.get("max_grade")
+            mg = None if mg_raw in (None, "auto") else \
+                max(0.05, min(0.35, float(mg_raw) / 100.0))
             self.send_json(export_ac_package(coords, rw, sm, name,
-                                             install_path, include_env))
+                                             install_path, include_env,
+                                             max_grade=mg,
+                                             monotonic=bool(body.get("monotonic", False))))
 
         elif parsed.path == "/api/preview":
             coords = body.get("coords", [])
             if not coords:
                 self.send_json({"error": "No coords"}, 400)
                 return
-            prof = fetch_elevation_profile(coords)
+            try:
+                mg_raw = body.get("max_grade")
+                mg = None if mg_raw in (None, "auto") else \
+                    max(0.05, min(0.35, float(mg_raw) / 100.0))
+                prof = fetch_elevation_profile(
+                    coords, max_grade=mg,
+                    monotonic=bool(body.get("monotonic", False)))
+            except ElevationUnavailable as e:
+                self.send_json({"error": f"Elevation unavailable — {e}"}, 400)
+                return
             mesh = process_road(coords,
                                 float(body.get("road_width", 8.0)),
                                 float(body.get("smooth", 0.3)),
-                                elev_profile=prof)
+                                elev_profile=prof, grass_width=0.0)
             if "error" in mesh:
                 self.send_json(mesh, 400)
                 return
             p    = mesh["elevation_profile"]
             step = max(1, len(p) // 500)
-            self.send_json({"stats": mesh["stats"], "elevation_profile": p[::step]})
+            out = {"stats": mesh["stats"], "elevation_profile": p[::step],
+                   "dem_mode": prof.get("dem_mode", "auto"),
+                   "dem_coverage": round(prof.get("dem_coverage", 0.0), 3)}
+            raw = prof.get("raw_elevs")
+            if raw:
+                # Same min-shift as the processed profile so the two curves
+                # overlay: shift by the min of the PROCESSED source data
+                # (despiked+graded+flattened), which is what process_road
+                # subtracts before smoothing.
+                pmin = min(prof["elevs"])
+                rstep = max(1, len(raw) // 500)
+                out["elevation_raw"] = [round(v - pmin, 2) for v in raw[::rstep]]
+                unc = prof.get("uncert") or []
+                if unc:
+                    ustep = max(1, len(unc) // 500)
+                    out["elevation_unc"] = [round(v, 2) for v in unc[::ustep]]
+                    out["sidehill_frac"] = round(prof.get("sidehill_frac", 0), 3)
+                    out["uncert_med"] = round(prof.get("uncert_med", 0), 1)
+                # Independent Copernicus check line. Datum differs slightly
+                # between DEMs, so align by median offset against the raw AWS
+                # samples at the same points — shape disagreements (artefacts)
+                # then stand out instead of a constant vertical shift.
+                try:
+                    alt_res = fetch_elevations_copernicus(prof["coords"])
+                    if alt_res:
+                        astep, alt = alt_res
+                        ref = raw[::astep][:len(alt)]
+                        off = float(np.median(np.array(alt[:len(ref)]) -
+                                              np.array(ref)))
+                        out["elevation_alt"] = [round(v - off - pmin, 2)
+                                                for v in alt]
+                        print(f"  [elevation] Copernicus check: {len(alt)} "
+                              f"points (datum offset {off:+.1f}m)")
+                except Exception as e:
+                    print(f"  [elevation] Copernicus check skipped: {e}")
+            self.send_json(out)
 
         else:
             self.send_json({"error": "Not found"}, 404)

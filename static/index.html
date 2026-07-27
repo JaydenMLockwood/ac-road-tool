@@ -181,6 +181,11 @@
   }
   .result-item:hover { border-color: var(--accent); background: var(--bg3); }
   .result-item.active { border-color: var(--accent); background: var(--bg3); }
+  .result-item.cached .result-name::after {
+    content: ' ●';
+    color: var(--green);
+    font-size: 10px;
+  }
   .result-name {
     font-size: 13px;
     font-weight: 600;
@@ -338,7 +343,7 @@
     pointer-events: none;
     transition: all 0.25s;
     z-index: 9999;
-    max-width: 400px;
+    max-width: 460px;
     text-align: center;
   }
   #toast.show {
@@ -414,6 +419,7 @@
     pointer-events: all;
   }
   .map-badge strong { color: var(--accent); }
+  .map-badge.warn { border-color: var(--accent2); color: var(--accent2); }
 
   /* ── Loading spinner ── */
   .spinner {
@@ -459,6 +465,17 @@
 <div class="app">
   <aside class="sidebar">
 
+    <!-- Elevation source mode -->
+    <div id="demBadge" style="display:flex; align-items:center; gap:8px;
+         padding:8px 10px; border-radius:6px; margin-bottom:12px;
+         font-family:var(--mono); font-size:11px; letter-spacing:0.04em;
+         background:rgba(120,130,150,0.12); color:var(--text2);
+         border:1px solid rgba(120,130,150,0.25);">
+      <span id="demBadgeDot" style="width:8px; height:8px; border-radius:50%;
+            background:#8a93a6; flex:none;"></span>
+      <span id="demBadgeText">ELEVATION: AUTOMATIC — online tiles</span>
+    </div>
+
     <!-- Search -->
     <div class="section">
       <div class="section-label">Search Road</div>
@@ -490,15 +507,15 @@
       <div class="field-label">Assetto Corsa folder — installs the track directly on export</div>
       <input class="text-input" id="acPath" type="text" value=""
         placeholder="C:\Program Files (x86)\Steam\steamapps\common\assettocorsa"/>
-      <label style="display:flex;align-items:center;gap:8px;margin-top:10px;cursor:pointer;font-size:13px;color:var(--text2);">
-        <input type="checkbox" id="includeEnv" checked style="accent-color:#e8b84b;"/>
-        Include surroundings — buildings &amp; trees from OpenStreetMap
-      </label>
     </div>
 
     <!-- Parameters -->
     <div class="section">
       <div class="section-label">Parameters</div>
+      <div id="lidarNote" style="display:none; padding:7px 9px; margin-bottom:10px;
+           border-radius:6px; font-size:11px; line-height:1.5;
+           background:rgba(232,184,75,0.08); border:1px solid rgba(232,184,75,0.35);
+           color:#e8b84b;"></div>
 
       <div class="param-row">
         <div class="param-head">
@@ -515,6 +532,29 @@
         </div>
         <input type="range" id="smoothSlider" min="0" max="100" step="5" value="30">
       </div>
+
+      <div class="param-row">
+        <div class="param-head">
+          <span class="field-label">Max Road Grade</span>
+          <span class="param-val" id="gradeVal">AUTO</span>
+        </div>
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:13px;color:var(--text2);margin-bottom:6px;">
+          <input type="checkbox" id="autoGradeChk" checked style="accent-color:#e8b84b;"/>
+          Auto — detect the road's real grade from its trend
+        </label>
+        <input type="range" id="gradeSlider" min="5" max="35" step="1" value="35" disabled>
+        <div style="font-size:11px; color:var(--text3);">
+          Sections steeper than the limit are treated as DEM errors and
+          bridged. Auto sets it from the road's own long-range trend, so
+          genuinely steep or dippy roads keep their character. Untick to set
+          manually — 35% ≈ match the DEM exactly.
+        </div>
+      </div>
+
+      <label style="display:flex;align-items:center;gap:8px;margin-top:4px;cursor:pointer;font-size:13px;color:var(--text2);">
+        <input type="checkbox" id="monoChk" style="accent-color:#e8b84b;"/>
+        Steady climb — road never reverses direction (removes phantom dips)
+      </label>
     </div>
 
     <!-- Stats -->
@@ -544,6 +584,12 @@
           Elevation profile
         </div>
         <canvas id="elevChart" height="72" style="width:100%; display:block; border-radius:4px;"></canvas>
+        <div id="elevLegend" style="display:none; font-size:10px; font-family:var(--mono); color:var(--text3); margin-top:3px;">
+          <span style="color:#e8b84b;">━ final road</span> &nbsp;
+          <span style="color:rgba(232,85,85,0.9);">━ raw DEM</span>
+          <span id="legendAlt" style="display:none; color:rgba(76,155,232,0.9);"> &nbsp;━ Copernicus check</span>
+        </div>
+        <div id="elevUnc" style="display:none; font-size:10px; font-family:var(--mono); color:var(--text3); margin-top:2px;"></div>
         <div style="display:flex; justify-content:space-between; margin-top:3px;">
           <span style="font-family:var(--mono); font-size:10px; color:var(--text3)" id="elevMin">—</span>
           <span style="font-family:var(--mono); font-size:10px; color:var(--text3)" id="elevMax">—</span>
@@ -553,6 +599,9 @@
 
     <!-- Actions -->
     <div class="btn-row">
+      <button class="btn btn-primary" id="confirmBtn" disabled>
+        ✓ Confirm Section
+      </button>
       <button class="btn btn-secondary" id="previewBtn" disabled>
         ▶ Preview Mesh Stats
       </button>
@@ -577,6 +626,9 @@
   <div style="flex:1; position:relative; display:flex; flex-direction:column; overflow:hidden;">
     <div id="map" style="flex:1; width:100%; height:100%;"></div>
     <div class="map-overlay">
+      <div class="map-badge" id="segBadge" style="display:none">
+        <strong id="segText">—</strong>
+      </div>
       <div class="map-badge" id="coordBadge" style="display:none">
         <strong id="coordText">—</strong>
       </div>
@@ -593,8 +645,22 @@ const state = {
   coords: [],         // trimmed [[lat, lon], ...] — used by preview/export
   fullCoords: [],     // full loaded route
   trim: { i0: 0, i1: 0 },
+  locked: false,      // start/end confirmed — gates preview/export
   processing: false,
+  geomCache: {},      // "type/id" -> geometry response (never refetched)
 };
+
+// Lock-in flow: after a road loads, the user places start/end and must
+// confirm the section before the heavy preview/export steps unlock.
+function setLocked(locked) {
+  state.locked = locked;
+  const hasRoad = state.coords.length > 0;
+  document.getElementById('confirmBtn').disabled = !hasRoad || locked;
+  document.getElementById('confirmBtn').textContent =
+    locked ? '✓ Section Locked' : '✓ Confirm Section';
+  document.getElementById('previewBtn').disabled = !locked;
+  document.getElementById('exportBtn').disabled = !locked;
+}
 
 // ── Map ────────────────────────────────────────────────────────────────────
 const map = L.map('map', {
@@ -608,6 +674,68 @@ L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
   subdomains: 'abcd',
   maxZoom: 19,
 }).addTo(map);
+
+// ── Elevation source mode (manual GeoTIFF vs automatic tiles) ──
+const demState = { mode: 'auto', dems: [], hires: false, rects: L.layerGroup().addTo(map) };
+
+function setDemBadge(mode, dems, coverage) {
+  const badge = document.getElementById('demBadge');
+  const dot = document.getElementById('demBadgeDot');
+  const txt = document.getElementById('demBadgeText');
+  if (mode === 'manual') {
+    const best = Math.min(...dems.map(d => d.res_m));
+    let s = `ELEVATION: MANUAL — ${dems.length} LiDAR file${dems.length > 1 ? 's' : ''} @ ${best} m`;
+    if (coverage !== undefined && coverage !== null) {
+      s += ` · ${Math.round(coverage * 100)}% of selected road covered`;
+    }
+    txt.textContent = s;
+    badge.style.background = 'rgba(232,184,75,0.10)';
+    badge.style.borderColor = 'rgba(232,184,75,0.45)';
+    badge.style.color = '#e8b84b';
+    dot.style.background = '#e8b84b';
+  } else {
+    txt.textContent = 'ELEVATION: AUTOMATIC — online tiles';
+    badge.style.background = 'rgba(120,130,150,0.12)';
+    badge.style.borderColor = 'rgba(120,130,150,0.25)';
+    badge.style.color = '';
+    dot.style.background = '#8a93a6';
+  }
+}
+
+async function refreshDemStatus() {
+  try {
+    const r = await fetch('/api/dem_status');
+    const d = await r.json();
+    demState.mode = d.mode;
+    demState.dems = d.dems || [];
+    demState.rects.clearLayers();
+    for (const dem of demState.dems) {
+      const b = dem.bounds;   // [minLat, minLon, maxLat, maxLon]
+      L.rectangle([[b[0], b[1]], [b[2], b[3]]], {
+        color: '#e8b84b', weight: 1.5, dashArray: '6 4',
+        fill: true, fillOpacity: 0.04, interactive: false,
+      }).addTo(demState.rects);
+    }
+    setDemBadge(demState.mode, demState.dems);
+    applyDemModeUI(demState.mode, null);
+  } catch (e) { /* server offline; badge stays at default */ }
+}
+refreshDemStatus();
+
+function handleDemResult(data) {
+  if (!data || !data.dem_mode) return;
+  applyDemModeUI(data.dem_mode, data.dem_coverage);
+  if (data.dem_mode === 'manual') {
+    setDemBadge('manual', demState.dems.length ? demState.dems
+                : [{res_m: '?'}], data.dem_coverage);
+    if (data.dem_coverage < 0.999) {
+      toast(`${Math.round((1 - data.dem_coverage) * 100)}% of the selected road is outside your uploaded map — that part used online tiles`, 'error', 6000);
+    }
+  } else {
+    setDemBadge('auto', []);
+  }
+}
+
 
 // Force Leaflet to recalculate its container size after DOM is ready
 setTimeout(() => map.invalidateSize(), 100);
@@ -643,6 +771,8 @@ function setProgress(el, show) {
 }
 
 // ── Search ─────────────────────────────────────────────────────────────────
+// Searching only lists candidates. Nothing is downloaded until a result is
+// clicked, so picking the wrong road first costs nothing.
 async function doSearch() {
   const q = document.getElementById('searchInput').value.trim();
   if (!q) return;
@@ -675,6 +805,7 @@ async function doSearch() {
 
       const div = document.createElement('div');
       div.className = 'result-item';
+      if (state.geomCache[`${r.osm_type}/${r.osm_id}`]) div.classList.add('cached');
       div.innerHTML = `
         <div class="result-name">${name}</div>
         <div class="result-sub">${sub}</div>
@@ -683,8 +814,10 @@ async function doSearch() {
       list.appendChild(div);
     });
 
-    // Auto-select first
-    selectResult(results[0], list.firstChild);
+    const hint = document.createElement('div');
+    hint.className = 'empty-msg';
+    hint.textContent = `${results.length} found — click one to load`;
+    list.appendChild(hint);
 
   } catch(e) {
     toast('Search failed — is the server running?', 'error');
@@ -694,6 +827,8 @@ async function doSearch() {
 }
 
 async function selectResult(result, el) {
+  if (state.processing) return;
+
   // Highlight UI
   document.querySelectorAll('.result-item').forEach(e => e.classList.remove('active'));
   if (el) el.classList.add('active');
@@ -713,6 +848,16 @@ async function selectResult(result, el) {
     map.setView([result.lat, result.lon], 14);
   }
 
+  // Already downloaded this road in this session? Reuse it — Overpass is
+  // slow and rate limited, and re-clicking a road shouldn't cost a query.
+  const key = `${result.osm_type}/${result.osm_id}`;
+  const cached = state.geomCache[key];
+  if (cached) {
+    applyGeometry(cached);
+    toast(`${cached.coords.length} GPS points (cached) — drag START/END, then Confirm`, 'success', 4500);
+    return;
+  }
+
   // Fetch geometry
   setLoading(true);
   toast('Fetching road geometry…', 'info');
@@ -722,22 +867,40 @@ async function selectResult(result, el) {
     const data = await res.json();
 
     if (data.error || !data.coords || !data.coords.length) {
-      toast(`Geometry error: ${data.error || 'no data'}`, 'error');
+      toast(`Geometry error: ${data.error || 'no data'}`, 'error', 6000);
       return;
     }
 
-    state.coords = data.coords;
-    drawRoad(data.coords);
-
-    document.getElementById('previewBtn').disabled = false;
-    document.getElementById('exportBtn').disabled = false;
-
-    toast(`Loaded ${data.coords.length} GPS points`, 'success');
+    state.geomCache[key] = data;
+    if (el) el.classList.add('cached');
+    applyGeometry(data);
+    toast(`Loaded ${data.coords.length} GPS points — drag START/END, then Confirm`, 'success', 4500);
 
   } catch(e) {
     toast('Failed to fetch road geometry', 'error');
   } finally {
     setLoading(false);
+  }
+}
+
+// Apply a geometry response to the map + enter start/end selection mode
+function applyGeometry(data) {
+  state.coords = data.coords;
+  drawRoad(data.coords);
+
+  setLocked(false);
+
+  // Show how much of the road actually stitched together. A road is stored
+  // in OSM as many pieces; if only some chained, the track is truncated.
+  const used = data.segments_used, total = data.segments_total;
+  const badge = document.getElementById('segBadge');
+  if (used && total) {
+    document.getElementById('segText').textContent =
+      `${used}/${total} road segments joined`;
+    badge.style.display = 'block';
+    badge.classList.toggle('warn', used < total * 0.6);
+  } else {
+    badge.style.display = 'none';
   }
 }
 
@@ -789,6 +952,23 @@ function drawRoad(coords, isReload = true) {
   line.addTo(map);
   roadLayers.push(line);
 
+  // Bridge / tunnel spans (3rd coord element flags them) — drawn distinctly so
+  // you can see where elevation is being levelled rather than sampled.
+  let runStart = -1;
+  for (let i = 0; i <= full.length; i++) {
+    const isStruct = i < full.length && full[i].length > 2 && full[i][2] > 0.5;
+    if (isStruct && runStart < 0) runStart = i;
+    if (!isStruct && runStart >= 0) {
+      if (i - runStart > 1) {
+        const seg = L.polyline(full.slice(runStart, i).map(c => [c[0], c[1]]),
+          { color: '#ff6b35', weight: 5, opacity: 0.85 });
+        seg.addTo(map);
+        roadLayers.push(seg);
+      }
+      runStart = -1;
+    }
+  }
+
   // Draggable start/end markers — drag along the road to trim it
   const makeIcon = (color, label) => L.divIcon({
     html: `<div style="background:${color};color:#0a0b0d;font-family:'Rajdhani',sans-serif;font-weight:700;font-size:11px;padding:2px 7px;border-radius:3px;white-space:nowrap;box-shadow:0 2px 8px rgba(0,0,0,0.6);cursor:grab;">${label} ⇕</div>`,
@@ -803,17 +983,19 @@ function drawRoad(coords, isReload = true) {
 
   startMarker.on('dragend', () => {
     const i = nearestCoordIndex(startMarker.getLatLng(), full);
-    state.trim.i0 = Math.min(i, state.trim.i1 - 3);
+    state.trim.i0 = Math.max(0, Math.min(i, state.trim.i1 - 3));
     applyTrim();
+    setLocked(false);
     drawRoad(full, false);
-    toast(`Start moved — ${state.coords.length} points selected`, 'success', 1800);
+    toast(`Start moved — ${state.coords.length} points selected. Confirm to lock in.`, 'success', 2500);
   });
   endMarker.on('dragend', () => {
     const i = nearestCoordIndex(endMarker.getLatLng(), full);
-    state.trim.i1 = Math.max(i, state.trim.i0 + 3);
+    state.trim.i1 = Math.min(full.length - 1, Math.max(i, state.trim.i0 + 3));
     applyTrim();
+    setLocked(false);
     drawRoad(full, false);
-    toast(`End moved — ${state.coords.length} points selected`, 'success', 1800);
+    toast(`End moved — ${state.coords.length} points selected. Confirm to lock in.`, 'success', 2500);
   });
 
   startMarker.addTo(map);
@@ -824,7 +1006,7 @@ function drawRoad(coords, isReload = true) {
 }
 
 // ── Elevation chart ────────────────────────────────────────────────────────
-function drawElevChart(profile, stats) {
+function drawElevChart(profile, stats, raw, alt, unc, meta) {
   if (!profile || profile.length < 2) return;
 
   const wrap = document.getElementById('elevChartWrap');
@@ -837,23 +1019,49 @@ function drawElevChart(profile, stats) {
   const ctx = canvas.getContext('2d');
   const W = canvas.width, H = canvas.height;
 
-  const minE = Math.min(...profile);
-  const maxE = Math.max(...profile);
+  // Shared y-scale across all curves so deviations show at true size
+  let all = profile;
+  if (raw && raw.length > 1) all = all.concat(raw);
+  if (alt && alt.length > 1) all = all.concat(alt);
+  const minE = Math.min(...all);
+  const maxE = Math.max(...all);
   const range = maxE - minE || 1;
   const pad = 4;
 
-  // Gradient fill
+  const toX = (i, len) => (i / (len - 1)) * (W - pad*2) + pad;
+  const toY = (v) => H - pad - ((v - minE) / range) * (H - pad*2);
+  const toXY = (arr, i) => [toX(i, arr.length), toY(arr[i])];
+
+  ctx.clearRect(0, 0, W, H);
+
+  // Uncertainty band — how far the DEM could be wrong here. Wide where the
+  // road is cut into a hillside (a horizontal error becomes a vertical one),
+  // narrow on flat ground. Drawn first, behind everything.
+  if (unc && unc.length > 1) {
+    const at = (i) => unc[Math.round(i / (profile.length - 1) * (unc.length - 1))];
+    ctx.beginPath();
+    for (let i = 0; i < profile.length; i++) {
+      const x = toX(i, profile.length), y = toY(profile[i] + at(i));
+      i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+    }
+    for (let i = profile.length - 1; i >= 0; i--) {
+      ctx.lineTo(toX(i, profile.length), toY(profile[i] - at(i)));
+    }
+    ctx.closePath();
+    ctx.fillStyle = 'rgba(160, 170, 200, 0.20)';
+    ctx.fill();
+  }
+
+  // Gradient fill (drawn FIRST so the raw line stays visible on top of it)
   const grad = ctx.createLinearGradient(0, 0, 0, H);
   grad.addColorStop(0, 'rgba(232,184,75,0.55)');
   grad.addColorStop(1, 'rgba(232,184,75,0.03)');
 
-  ctx.clearRect(0, 0, W, H);
   ctx.beginPath();
-  profile.forEach((e, i) => {
-    const x = (i / (profile.length - 1)) * (W - pad*2) + pad;
-    const y = H - pad - ((e - minE) / range) * (H - pad*2);
+  for (let i = 0; i < profile.length; i++) {
+    const [x, y] = toXY(profile, i);
     i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
-  });
+  }
   // Close path for fill
   ctx.lineTo(W - pad, H - pad);
   ctx.lineTo(pad, H - pad);
@@ -861,13 +1069,41 @@ function drawElevChart(profile, stats) {
   ctx.fillStyle = grad;
   ctx.fill();
 
+  // Raw DEM samples — red line over the fill, under the gold line.
+  // If a phantom hill shows here, it's in the source data, not processing.
+  if (raw && raw.length > 1) {
+    ctx.beginPath();
+    for (let i = 0; i < raw.length; i++) {
+      const [x, y] = toXY(raw, i);
+      i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+    }
+    ctx.strokeStyle = 'rgba(232, 85, 85, 0.9)';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+  }
+  // Copernicus check — independent DEM. Where blue agrees with red, the
+  // feature is real terrain; where they split, it's a data artefact.
+  if (alt && alt.length > 1) {
+    ctx.beginPath();
+    for (let i = 0; i < alt.length; i++) {
+      const [x, y] = toXY(alt, i);
+      i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+    }
+    ctx.strokeStyle = 'rgba(76, 155, 232, 0.9)';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+  }
+  document.getElementById('elevLegend').style.display =
+    raw && raw.length > 1 ? '' : 'none';
+  document.getElementById('legendAlt').style.display =
+    alt && alt.length > 1 ? '' : 'none';
+
   // Line on top
   ctx.beginPath();
-  profile.forEach((e, i) => {
-    const x = (i / (profile.length - 1)) * (W - pad*2) + pad;
-    const y = H - pad - ((e - minE) / range) * (H - pad*2);
+  for (let i = 0; i < profile.length; i++) {
+    const [x, y] = toXY(profile, i);
     i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
-  });
+  }
   ctx.strokeStyle = '#e8b84b';
   ctx.lineWidth = 1.5;
   ctx.lineJoin = 'round';
@@ -875,12 +1111,21 @@ function drawElevChart(profile, stats) {
 
   // Min/max labels
   const rawMin = stats.elev_min_m !== undefined ? stats.elev_min_m : minE;
-  const rawMax = (stats.elev_min_m !== undefined ? stats.elev_min_m : minE) + range;
   document.getElementById('elevMin').textContent = Math.round(rawMin) + ' m';
   document.getElementById('elevMax').textContent = Math.round(rawMin + range) + ' m';
+
+  const uncEl = document.getElementById('elevUnc');
+  if (meta && meta.uncert_med !== undefined && unc && unc.length > 1) {
+    uncEl.style.display = '';
+    uncEl.textContent =
+      `DEM confidence: ±${meta.uncert_med} m typical · ` +
+      `${Math.round((meta.sidehill_frac || 0) * 100)}% of route on steep sidehill`;
+  } else {
+    uncEl.style.display = 'none';
+  }
 }
 
-function updateStats(s, profile) {
+function updateStats(s, profile, raw, alt, unc, meta) {
   document.getElementById('statLength').textContent = s.length_km;
   document.getElementById('statCorners').textContent = s.corners;
   document.getElementById('statClimb').textContent =
@@ -890,13 +1135,13 @@ function updateStats(s, profile) {
   document.getElementById('statsSection').style.display = '';
 
   if (s.has_elevation && profile && profile.length > 1) {
-    drawElevChart(profile, s);
+    drawElevChart(profile, s, raw, alt, unc, meta);
   }
 }
 
 // ── Preview ────────────────────────────────────────────────────────────────
 async function doPreview() {
-  if (!state.coords.length) return;
+  if (!state.coords.length || !state.locked || state.processing) return;
   setLoading(true);
   toast('Fetching elevation + building mesh…', 'info', 12000);
 
@@ -908,18 +1153,22 @@ async function doPreview() {
         coords: state.coords,
         road_width: parseFloat(document.getElementById('widthSlider').value),
         smooth: parseFloat(document.getElementById('smoothSlider').value) / 100,
+        max_grade: gradeValue(),
+        monotonic: document.getElementById('monoChk').checked,
       }),
     });
     const data = await res.json();
 
-    if (data.error) { toast(data.error, 'error'); return; }
+    if (data.error) { toast(data.error, 'error', 8000); return; }
 
     const s = data.stats;
-    updateStats(s, data.elevation_profile);
+    updateStats(s, data.elevation_profile, data.elevation_raw,
+                data.elevation_alt, data.elevation_unc, data);
+    handleDemResult(data);
 
     const elevMsg = s.has_elevation
       ? `↑ ${Math.round(s.total_climb_m)}m climb · ${Math.round(s.elev_range_m)}m range`
-      : 'Elevation data unavailable (API may be down)';
+      : 'no elevation';
     toast(`${s.length_km} km · ${s.corners} corners · ${elevMsg}`, 'success', 5000);
 
   } catch(e) {
@@ -931,7 +1180,7 @@ async function doPreview() {
 
 // ── Export ─────────────────────────────────────────────────────────────────
 async function doExport() {
-  if (!state.coords.length || state.processing) return;
+  if (!state.coords.length || !state.locked || state.processing) return;
   setLoading(true);
 
   const trackName = document.getElementById('trackName').value.trim()
@@ -947,17 +1196,20 @@ async function doExport() {
         coords: state.coords,
         road_width: parseFloat(document.getElementById('widthSlider').value),
         smooth: parseFloat(document.getElementById('smoothSlider').value) / 100,
+        max_grade: gradeValue(),
+        monotonic: document.getElementById('monoChk').checked,
         track_name: trackName,
         install_path: document.getElementById('acPath').value.trim() || null,
-        include_env: document.getElementById('includeEnv').checked,
       }),
     });
     const data = await res.json();
 
-    if (data.error) { toast(data.error, 'error'); return; }
+    if (data.error) { toast(data.error, 'error', 10000); return; }
 
     const s = data.stats;
-    updateStats(s, data.elevation_profile);
+    updateStats(s, data.elevation_profile, data.elevation_raw,
+                null, data.elevation_unc, data);
+    handleDemResult(data);
 
     // Show download
     const link = document.getElementById('downloadLink');
@@ -965,7 +1217,7 @@ async function doExport() {
     link.textContent = `⬇ ${data.filename}`;
     const elevInfo = s.has_elevation
       ? ` · ↑${Math.round(s.total_climb_m)}m / ↓${Math.round(s.total_descent_m)}m`
-      : ' · flat terrain';
+      : '';
     const envInfo = (data.buildings || data.trees)
       ? ` · ${data.buildings} bldgs / ${data.trees} trees`
       : '';
@@ -997,11 +1249,60 @@ document.getElementById('widthSlider').addEventListener('input', function() {
 document.getElementById('smoothSlider').addEventListener('input', function() {
   document.getElementById('smoothVal').textContent = this.value + '%';
 });
+function updateGradeUI() {
+  const auto = document.getElementById('autoGradeChk').checked;
+  const slider = document.getElementById('gradeSlider');
+  slider.disabled = auto;
+  const val = document.getElementById('gradeVal');
+  if (!auto) {
+    val.textContent = slider.value + '%';
+  } else if (demState.hires) {
+    val.textContent = 'OFF · LiDAR';   // trusting the uploaded map
+  } else {
+    val.textContent = 'AUTO';
+  }
+}
+document.getElementById('gradeSlider').addEventListener('input', updateGradeUI);
+document.getElementById('autoGradeChk').addEventListener('change', updateGradeUI);
+
+// Reflect the elevation mode in the parameter controls, so it is obvious
+// when corrections/smoothing are inactive because LiDAR is trusted.
+function applyDemModeUI(mode, coverage) {
+  demState.hires = (mode === 'manual') && (coverage == null || coverage > 0.9);
+  const note = document.getElementById('lidarNote');
+  if (mode === 'manual') {
+    note.style.display = '';
+    if (coverage != null && coverage <= 0.9) {
+      note.textContent =
+        `Uploaded map covers only ${Math.round(coverage * 100)}% of this road — ` +
+        `standard corrections stay active for the uncovered part.`;
+    } else {
+      note.textContent =
+        'LiDAR mode: elevation follows your uploaded map — grade limiting is off ' +
+        'and profile smoothing is minimal (8 m). GPS Smoothing below still shapes ' +
+        'the road LINE from OSM geometry; it does not smooth elevation.';
+    }
+  } else {
+    note.style.display = 'none';
+  }
+  updateGradeUI();
+}
+function gradeValue() {
+  return document.getElementById('autoGradeChk').checked
+    ? 'auto'
+    : parseFloat(document.getElementById('gradeSlider').value);
+}
 
 // ── Search events ──────────────────────────────────────────────────────────
 document.getElementById('searchBtn').addEventListener('click', doSearch);
 document.getElementById('searchInput').addEventListener('keydown', (e) => {
   if (e.key === 'Enter') doSearch();
+});
+
+document.getElementById('confirmBtn').addEventListener('click', () => {
+  if (!state.coords.length) return;
+  setLocked(true);
+  toast(`Section locked — ${state.coords.length} points. Preview or export when ready.`, 'success', 3500);
 });
 
 document.getElementById('previewBtn').addEventListener('click', doPreview);

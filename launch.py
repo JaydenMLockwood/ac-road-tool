@@ -10,11 +10,19 @@ import os
 
 PORT = 8743
 
+# import name -> pip name (differ for Pillow)
+DEPS = {
+    'numpy':  'numpy',
+    'scipy':  'scipy',
+    'pyproj': 'pyproj',
+    'PIL':    'pillow',
+}
+
 def check_deps():
     missing = []
-    for pkg in ['numpy', 'scipy', 'pyproj']:
+    for mod, pkg in DEPS.items():
         try:
-            __import__(pkg)
+            __import__(mod)
         except ImportError:
             missing.append(pkg)
     if missing:
