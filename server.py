@@ -299,6 +299,8 @@ def fetch_road_geometry(osm_type: str, osm_id: str) -> dict:
                  for g in el["geometry"]]
                 for el in elements]
     seed_idx = 0
+    # The clicked way's classification — drives the road surface texture
+    seed_tags = elements[0].get("tags", {}) or {}
 
     # ── Name expansion (single way only — relations already give members)
     if osm_type == "way":
@@ -344,7 +346,9 @@ def fetch_road_geometry(osm_type: str, osm_id: str) -> dict:
     print(f"  [geometry] stitched {used}/{len(segments)} segments, "
           f"{len(coords)} points")
     out = {"coords": coords, "count": len(coords),
-           "segments_used": used, "segments_total": len(segments)}
+           "segments_used": used, "segments_total": len(segments),
+           "road_type": seed_tags.get("highway"),
+           "road_surface": seed_tags.get("surface")}
     _geom_store(osm_type, osm_id, out)
     return out
 
@@ -373,7 +377,7 @@ def fetch_surroundings(coords: list, radius_m: float = 60.0) -> dict:
     # Cache per road selection: re-exporting the same section (the natural
     # reaction to a busy-Overpass failure) must not refetch anything.
     import hashlib
-    h = hashlib.md5(f"v3|{radius_m:.0f}|{len(coords)}".encode())
+    h = hashlib.md5(f"v4|{radius_m:.0f}|{len(coords)}".encode())
     for c in coords[::max(1, len(coords) // 500)]:
         h.update(f"{c[0]:.5f},{c[1]:.5f};".encode())
     cache_path = os.path.join(OUTPUT_DIR, "surroundings", h.hexdigest() + ".json")
@@ -456,7 +460,8 @@ def fetch_surroundings(coords: list, radius_m: float = 60.0) -> dict:
                         pass
                     h = max(2.5, min(h, 60.0))
                     if len(outline) >= 3:
-                        out["buildings"].append({"outline": outline, "height": h})
+                        out["buildings"].append({"outline": outline, "height": h,
+                                                 "kind": tags.get("building")})
                 elif "highway" in tags:
                     # Adjacent roads — the arnis approach: render every
                     # highway the query returns, draped on the terrain.
@@ -541,7 +546,7 @@ def fetch_surroundings(coords: list, radius_m: float = 60.0) -> dict:
 
     # Caps to keep the KN5 sane
     out["buildings"] = out["buildings"][:800]
-    out["trees"]     = out["trees"][:1500]
+    out["trees"]     = out["trees"][:4000]
     out["forests"]   = out["forests"][:300]
     out["roads"]     = out["roads"][:400]
     out["waterways"] = out["waterways"][:200]
@@ -686,14 +691,24 @@ def build_environment_meshes(surroundings: dict, mesh: dict,
             w = 1.0 / (np.asarray(d) + 0.5)
             return float(np.sum(g_y[np.asarray(i)] * w) / np.sum(w))
 
-        def ground_max(x, z):
-            # Highest of the 4 nearest terrain vertices. A triangle surface
-            # can never rise above its corner heights, so a strip vertex at
-            # this height (+ lift) is GUARANTEED above the rendered terrain —
-            # the IDW average undershoots on slopes and lets grass poke
-            # through draped roads.
-            _, i = kd.query([x, z], k=4)
-            return float(np.max(g_y[np.asarray(i)]))
+        # True rendered-surface height. The terrain mesh is a Delaunay
+        # triangulation of these same points, so linear interpolation over
+        # their Delaunay reproduces the drawn surface almost exactly — unlike
+        # the vertex-bound lookups above, which over/undershoot by the local
+        # relief on slopes (max-bounds left draped strips floating a metre
+        # above hillsides; min-bounds still missed cliff-edge triangles).
+        from scipy.interpolate import LinearNDInterpolator
+        try:
+            _lin = LinearNDInterpolator(g_xz, g_y)
+        except Exception:
+            _lin = None
+
+        def ground_surf(x, z):
+            if _lin is not None:
+                v = _lin(x, z)
+                if v == v:                      # inside the hull (not NaN)
+                    return float(v)
+            return ground_y_smooth(x, z)
     else:
         cl_xz = np.array([[p[0], p[2]] for p in cl])
         cl_y  = np.array([p[1] for p in cl])
@@ -704,7 +719,7 @@ def build_environment_meshes(surroundings: dict, mesh: dict,
             return float(cl_y[i]) - ground_drop(float(d) - hw)
 
         ground_y_smooth = ground_y
-        ground_max = ground_y
+        ground_surf = ground_y
 
     def to_local(lat, lon):
         X, Z = proj.transform(lon, lat)
@@ -742,13 +757,13 @@ def build_environment_meshes(surroundings: dict, mesh: dict,
     if lc_latlon is None:
         lc_fn = None
 
-    if (forests or lc_fn) and len(tree_pts) < 1500:
+    if (forests or lc_fn) and len(tree_pts) < 4000:
         rng = np.random.default_rng(99)
         min_lat = hw + 4.0          # keep off road and verge
-        max_lat = hw + GRASS_W + SKIRT_W - 3.0
-        step = 12                    # try planting every 12m of road
+        max_lat = TERRAIN_MAX_DIST - 5.0   # plant right out to the terrain edge
+        step = 8                     # try planting every 8m of road
         for ci in range(0, len(cl), step):
-            if len(tree_pts) >= 1500:
+            if len(tree_pts) >= 4000:
                 break
             p = cl[ci]
             pn = cl[min(ci + 1, len(cl) - 1)]
@@ -756,7 +771,7 @@ def build_environment_meshes(surroundings: dict, mesh: dict,
             L = math.hypot(dx, dz) or 1.0
             px_, pz_ = -dz / L, dx / L     # perpendicular
             for side in (+1, -1):
-                for _ in range(2):
+                for _ in range(4):
                     lat_d = rng.uniform(min_lat, max_lat)
                     along = rng.uniform(-6, 6)
                     x = p[0] + side * px_ * lat_d + dx / L * along
@@ -794,14 +809,16 @@ def build_environment_meshes(surroundings: dict, mesh: dict,
     meshes = []
 
     # ── Buildings: extruded footprints, alternating two wall materials ──
-    bld = {"building": [[], [], 0], "building2": [[], [], 0]}
+    bld = {"building": [[], [], 0], "building2": [[], [], 0],
+           "building3": [[], [], 0], "commercial": [[], [], 0]}
     roof_verts, roof_idx = [], []
     roof_part = 0
 
     def flush_building(mat):
         verts_w, idx_w, part_w = bld[mat]
         if verts_w:
-            suffix = "" if mat == "building" else "B"
+            suffix = {"building": "", "building2": "B",
+                      "building3": "C", "commercial": "D"}[mat]
             meshes.append((f"ENV_BLDG{suffix}_{part_w}", verts_w, idx_w, mat))
             bld[mat] = [[], [], part_w + 1]
 
@@ -813,20 +830,52 @@ def build_environment_meshes(surroundings: dict, mesh: dict,
             roof_verts, roof_idx = [], []
 
     for bi, b in enumerate(surroundings.get("buildings", [])):
-        wall_mat = "building" if bi % 2 == 0 else "building2"
-        verts, idx, _ = bld[wall_mat]
         pts = [to_local(la, lo) for la, lo in b["outline"]]
         if len(pts) > 2 and pts[0] == pts[-1]:
             pts = pts[:-1]
         if len(pts) < 3 or len(pts) > 60:
             continue
+        # Size classification: big or tall footprints become commercial
+        # blocks (concrete + glazing band per storey, flat roof); the rest
+        # are houses cycling three wall finishes so streets don't alternate
+        # two walls A/B/A/B.
+        fp_area = abs(sum(pts[i][0] * pts[(i+1) % len(pts)][1]
+                          - pts[(i+1) % len(pts)][0] * pts[i][1]
+                          for i in range(len(pts)))) / 2.0
+        HOUSE_KINDS = ("house", "detached", "residential",
+                       "semidetached_house", "bungalow", "farm", "terrace",
+                       "static_caravan", "cabin", "hut", "shed", "garage",
+                       "garages", "barn", "farm_auxiliary", "stable")
+        COMM_KINDS = ("commercial", "industrial", "retail", "warehouse",
+                      "office", "supermarket", "hotel", "apartments",
+                      "school", "hospital", "civic", "public")
+        kind = (b.get("kind") or "").lower()
+        if kind in HOUSE_KINDS:
+            commercial = False
+        elif kind in COMM_KINDS:
+            commercial = True
+        else:                     # building=yes / unknown: fall back to size
+            commercial = fp_area > 800.0 or b["height"] > 9.0
+        if commercial:
+            wall_mat = "commercial"
+        else:
+            wall_mat = ("building", "building2", "building3")[bi % 3]
+        verts, idx, _ = bld[wall_mat]
+        # One texture tile per ~3.2m storey: multi-storey walls repeat their
+        # window row per floor instead of stretching one row up the facade.
+        v_top = max(1.0, round(b["height"] / 3.2))
         # Footprint crossing the carriageway = bad mapping or road smoothing
         # cutting through it; either way a building on the track is worse
         # than no building.
         d_b, _ = kd_road.query(np.array(pts))
         if float(d_b.min()) < hw:
             continue
-        base = min(ground_y(x, z) for x, z in pts) - 0.5
+        gpts = list(pts)
+        for i in range(len(pts)):          # edge midpoints: long walls on
+            x0, z0 = pts[i]                # ridge lines dip between corners
+            x1, z1 = pts[(i+1) % len(pts)]
+            gpts.append(((x0+x1)/2.0, (z0+z1)/2.0))
+        base = min(ground_surf(x, z) for x, z in gpts) - 0.6
         top  = base + 0.5 + b["height"]
 
         if len(verts) + len(pts)*5 > 60000:
@@ -843,8 +892,8 @@ def build_environment_meshes(surroundings: dict, mesh: dict,
             v = len(verts)
             verts.append(((x0, base, z0), (nx_, 0, nz_), (0,  0), (ex/el, 0, ez/el)))
             verts.append(((x1, base, z1), (nx_, 0, nz_), (u1, 0), (ex/el, 0, ez/el)))
-            verts.append(((x1, top,  z1), (nx_, 0, nz_), (u1, 1), (ex/el, 0, ez/el)))
-            verts.append(((x0, top,  z0), (nx_, 0, nz_), (0,  1), (ex/el, 0, ez/el)))
+            verts.append(((x1, top,  z1), (nx_, 0, nz_), (u1, v_top), (ex/el, 0, ez/el)))
+            verts.append(((x0, top,  z0), (nx_, 0, nz_), (0,  v_top), (ex/el, 0, ez/el)))
             idx.extend((v, v+1, v+2,  v, v+2, v+3))
             idx.extend((v, v+2, v+1,  v, v+3, v+2))
 
@@ -852,7 +901,8 @@ def build_environment_meshes(surroundings: dict, mesh: dict,
         # a road are HOUSES, so rectangular-ish low footprints get a proper
         # gable roof (two pitched planes + triangular gable ends), with a
         # small eave overhang. Complex or tall footprints keep the flat roof.
-        frame = _gable_frame(pts) if (b["height"] <= 8.0 and len(pts) <= 8) else None
+        frame = _gable_frame(pts) if (not commercial and b["height"] <= 8.0
+                                      and len(pts) <= 8) else None
         if frame is not None and frame["hw"] > 1.5:
             fx, fz = frame["cx"], frame["cz"]
             ux_, uz_ = frame["ux"], frame["uz"]
@@ -904,6 +954,8 @@ def build_environment_meshes(surroundings: dict, mesh: dict,
                 roof_idx.extend((r0+i0, r0+i2, r0+i1))
     flush_building("building")
     flush_building("building2")
+    flush_building("building3")
+    flush_building("commercial")
     flush_roofs()
 
     # ── Draped linear features: adjacent roads, waterways, barriers ──
@@ -973,14 +1025,10 @@ def build_environment_meshes(surroundings: dict, mesh: dict,
     def _emit_flat(pts3, half_w, lift, verts, idx):
         """Emit a draped strip from [(x, z, ext_y_or_None, u), ...].
 
-        Heights are computed PER EDGE VERTEX from ground_max — the highest of
-        the local terrain corners, which the terrain surface can never exceed
-        — so the strip cannot be poked through by grass on slopes (the old
-        IDW-average heights undershot the triangle surface between vertices).
-        The floor heights are then gaussian-smoothed along the run so the
-        strip drives/reads like a graded road rather than stair-stepping,
-        with the smooth clamped to never dip back below the floor. The strip
-        also banks with the terrain, since each edge carries its own height.
+        Heights are computed PER EDGE VERTEX from ground_surf — the true
+        rendered-terrain height — plus a small lift, then lightly smoothed
+        along the run (clamped to never dip below the floor). The strip hugs
+        and banks with the terrain since each edge carries its own height.
         Junction-extension rows (ext_y set) keep their tucked height so they
         stay under the main road's edge.
         """
@@ -992,10 +1040,14 @@ def build_environment_meshes(surroundings: dict, mesh: dict,
         px_, pz_ = -dzs_ / L, dxs_ / L
         hs = {}
         for side in (+1, -1):
-            floor = np.array([ground_max(axs[k] + side*px_[k]*half_w,
-                                         azs[k] + side*pz_[k]*half_w) + lift
+            # ground_surf is the actual rendered terrain height, which is
+            # already smooth along the run — so the strip can hug the ground
+            # with only a small lift, instead of riding on max-vertex bounds
+            # (staircase) or a dilated envelope (floats above every hill).
+            floor = np.array([ground_surf(axs[k] + side*px_[k]*half_w,
+                                          azs[k] + side*pz_[k]*half_w) + lift
                               for k in range(n)])
-            h = np.maximum(gaussian_filter1d(floor, sigma=1.5), floor) \
+            h = np.maximum(gaussian_filter1d(floor, sigma=1.2), floor) \
                 if n >= 3 else floor
             for k, p in enumerate(pts3):
                 if p[2] is not None:          # junction extension: tuck
@@ -1166,21 +1218,14 @@ def build_environment_meshes(surroundings: dict, mesh: dict,
         print(f"  [surroundings] draped {n_side} road, {n_water} waterway, "
               f"{n_barr} barrier strip(s)")
 
-    # ── Trees: hexagonal trunk (bark brown) + low-poly double-cone canopy ──
-    # The old 4-sided pyramid on a green box read as neither tree nor bush.
-    # Now: conifers (tall narrow cone) and broadleaf (rounded blob), each with
-    # random size + rotation so a row of trees doesn't look copy-pasted.
-    trunk_verts, trunk_idx = [], []
+    # ── Trees: alpha-cutout cross-plane impostors ──
+    # Three quads at 60° with a painted RGBA tree silhouette (alpha-tested
+    # material) — the standard sim-racing technique. Reads as a real tree at
+    # driving distance and costs ~12 verts instead of ~40, which is what
+    # makes the higher scatter density affordable.
     cans = {"tree": [[], [], 0], "tree2": [[], [], 0]}
-    t_part = 0
-    HEX = 6
 
     def flush_tree_meshes():
-        nonlocal trunk_verts, trunk_idx, t_part
-        if trunk_verts:
-            meshes.append((f"ENV_TRUNK_{t_part}", trunk_verts, trunk_idx, "dirt"))
-            t_part += 1
-            trunk_verts, trunk_idx = [], []
         for mat in cans:
             cv, ci, cp = cans[mat]
             if cv:
@@ -1190,84 +1235,37 @@ def build_environment_meshes(surroundings: dict, mesh: dict,
 
     rng_t = np.random.default_rng(7)
     for x, z in tree_pts:
-        gy = ground_y(x, z)
-        s   = rng_t.uniform(0.7, 1.5)
-        yaw = rng_t.uniform(0.0, 2.0 * math.pi)
-        if rng_t.random() < 0.5:      # conifer: tall, narrow, tiered
-            th, ch, cr, tr = 1.2*s, 6.5*s, 1.9*s, 0.22*s
-            can_mat = "tree2"          # darker olive canopy
-        else:                         # broadleaf: shorter, rounder blob
-            th, ch, cr, tr = 2.2*s, 5.0*s, 2.6*s, 0.28*s
-            can_mat = "tree"
-        can_verts, can_idx, _ = cans[can_mat]
-
-        if len(trunk_verts) + 2*HEX > 60000 or len(can_verts) + 16 > 60000:
+        gy = ground_surf(x, z)             # true rendered-terrain height
+        gy_base = gy - 0.5                 # quad foot: sunk into the surface
+        if rng_t.random() < 0.45:          # conifer: tall and narrow
+            h = rng_t.uniform(8.0, 14.0)
+            w = h * 0.46
+            mat = "tree2"
+        else:                              # broadleaf: shorter and wide
+            h = rng_t.uniform(6.5, 11.0)
+            w = h * 0.88
+            mat = "tree"
+        yaw = rng_t.uniform(0.0, math.pi)
+        cv, ci, _ = cans[mat]
+        if len(cv) + 12 > 60000:
             flush_tree_meshes()
-            can_verts, can_idx, _ = cans[can_mat]
-
-        # Trunk: hexagonal prism, double-sided
-        v0 = len(trunk_verts)
-        for k in range(HEX):
-            a = yaw + k * 2.0 * math.pi / HEX
-            cx_, cz_ = math.cos(a), math.sin(a)
-            trunk_verts.append(((x+cx_*tr, gy,    z+cz_*tr), (cx_, 0, cz_), (k/HEX, 0), (1, 0, 0)))
-            trunk_verts.append(((x+cx_*tr, gy+th, z+cz_*tr), (cx_, 0, cz_), (k/HEX, 1), (1, 0, 0)))
-        for k in range(HEX):
-            a0 = v0 + k*2
-            b0 = v0 + ((k+1) % HEX)*2
-            trunk_idx.extend((a0, b0, b0+1,  a0, b0+1, a0+1))
-            trunk_idx.extend((a0, b0+1, b0,  a0, a0+1, b0+1))
-
-        # Canopy. Perfect cones read as cartoons; real silhouettes are lumpy.
-        # Broadleaf: a faceted blob — two stacked hex rings with per-vertex
-        # radial jitter and offset yaw, capped by tips. Conifer: two
-        # overlapping cone tiers (the classic pine step), also jittered.
-        c0 = len(can_verts)
-        if can_mat == "tree2":     # conifer: two cone tiers
-            for tier, (ry_f, rr, tip_f) in enumerate(
-                    (((0.0), 1.0, 0.60), ((0.40), 0.62, 1.00))):
-                ring0 = len(can_verts)
-                ry = gy + th + ch * ry_f
-                for k in range(HEX):
-                    a = yaw + (k + 0.5 * tier) * 2.0 * math.pi / HEX
-                    j = rng_t.uniform(0.85, 1.15)
-                    rr_j = cr * rr * j
-                    cx_, cz_ = math.cos(a), math.sin(a)
-                    can_verts.append(((x+cx_*rr_j, ry, z+cz_*rr_j),
-                                      (cx_*0.75, 0.35, cz_*0.75),
-                                      (k/HEX, 0.2 + 0.4*tier), (1, 0, 0)))
-                tip = len(can_verts)
-                can_verts.append(((x, gy+th+ch*tip_f, z), (0, 1, 0),
-                                  (0.5, 1), (1, 0, 0)))
-                for k in range(HEX):
-                    r0 = ring0 + k
-                    r1 = ring0 + (k+1) % HEX
-                    can_idx.extend((r0, r1, tip,  r0, tip, r1))
-        else:                      # broadleaf: jittered faceted blob
-            can_verts.append(((x, gy+th, z), (0, -1, 0), (0.5, 0), (1, 0, 0)))
-            rings = []
-            for ri, (hf, rf) in enumerate(((0.30, 1.00), (0.72, 0.78))):
-                ring0 = len(can_verts)
-                rings.append(ring0)
-                ry = gy + th + ch * hf
-                for k in range(HEX):
-                    a = yaw + (k + 0.5 * ri) * 2.0 * math.pi / HEX
-                    j = rng_t.uniform(0.80, 1.20)
-                    rr_j = cr * rf * j
-                    cx_, cz_ = math.cos(a), math.sin(a)
-                    can_verts.append(((x+cx_*rr_j, ry + rng_t.uniform(-0.15, 0.15)*s,
-                                       z+cz_*rr_j),
-                                      (cx_*0.8, 0.25 + 0.3*ri, cz_*0.8),
-                                      (k/HEX, 0.3 + 0.35*ri), (1, 0, 0)))
-            top_v = len(can_verts)
-            can_verts.append(((x, gy+th+ch, z), (0, 1, 0), (0.5, 1), (1, 0, 0)))
-            for k in range(HEX):
-                a0 = rings[0] + k;  a1 = rings[0] + (k+1) % HEX
-                b0 = rings[1] + k;  b1 = rings[1] + (k+1) % HEX
-                can_idx.extend((c0, a1, a0,  c0, a0, a1))          # bottom fan
-                can_idx.extend((a0, a1, b1,  a0, b1, b0))          # band
-                can_idx.extend((a0, b1, a1,  a0, b0, b1))
-                can_idx.extend((b0, b1, top_v,  b0, top_v, b1))    # top fan
+            cv, ci, _ = cans[mat]
+        top = gy + h
+        # Up normals: cross-planes lit like the ground, so no plane goes
+        # black when the sun is behind it.
+        for pi in range(3):
+            a = yaw + pi * math.pi / 3.0
+            dx_ = math.cos(a) * w * 0.5
+            dz_ = math.sin(a) * w * 0.5
+            v0 = len(cv)
+            # DirectX v=0 is the TOP of the image (= tree top), so the base
+            # vertices carry v=1 and the top vertices v=0.
+            cv.append(((x - dx_, gy_base, z - dz_), (0, 1, 0), (0, 1), (1, 0, 0)))
+            cv.append(((x + dx_, gy_base, z + dz_), (0, 1, 0), (1, 1), (1, 0, 0)))
+            cv.append(((x + dx_, top,     z + dz_), (0, 1, 0), (1, 0), (1, 0, 0)))
+            cv.append(((x - dx_, top,     z - dz_), (0, 1, 0), (0, 0), (1, 0, 0)))
+            ci.extend((v0, v0+1, v0+2,  v0, v0+2, v0+3))
+            ci.extend((v0, v0+2, v0+1,  v0, v0+3, v0+2))
     flush_tree_meshes()
 
     return {"meshes": meshes, "n_trees": len(tree_pts),
@@ -2617,6 +2615,102 @@ def build_terrain_meshes(mesh: dict, grid: dict) -> list:
 
     return out
 
+
+FAR_MAX_DIST  = 500.0   # how far the visual-only backdrop terrain reaches (m)
+FAR_GRID_STEP = 40.0    # backdrop grid spacing (m)
+
+
+def build_far_terrain(mesh: dict, grid: dict) -> list:
+    """
+    Coarse VISUAL-ONLY terrain ring from the inner terrain edge out to
+    FAR_MAX_DIST. Without it, a road section seen across a valley floats
+    over void — the hill it sits on ends 90m from the carriageway.
+
+    Heights use the same anchoring as the inner terrain at full blend
+    (road height + DEM offset relative to the DEM at the nearest road
+    point), so the two surfaces agree where they overlap; the ring is sunk
+    0.6m so the one-cell overlap tucks underneath the inner mesh. Names
+    carry no digit prefix → no physics.
+    """
+    from scipy.spatial import Delaunay, cKDTree
+    rx, rz, ry = grid["rx"], grid["rz"], grid["ry"]
+    dem_ref = grid["dem_ref"]
+    g_drop = mesh["stats"].get("grass_drop", GRASS_DROP)
+    lc = mesh.get("land_cover")
+    inv_ll = mesh.get("to_latlon")
+    if inv_ll is None:
+        return []
+
+    cl_xz = np.array([[p[0], p[2]] for p in mesh["centerline"]])
+    kd_ref = cKDTree(np.column_stack([rx, rz]))
+
+    step = FAR_GRID_STEP
+    pad = FAR_MAX_DIST + step
+    min_x = float(cl_xz[:, 0].min()) - pad
+    max_x = float(cl_xz[:, 0].max()) + pad
+    min_z = float(cl_xz[:, 1].min()) - pad
+    max_z = float(cl_xz[:, 1].max()) + pad
+    est = ((max_x - min_x) / step) * ((max_z - min_z) / step)
+    if est > 45000:                        # very long roads: coarsen, not grow
+        step *= math.sqrt(est / 45000.0)
+    gx = np.arange(min_x, max_x + step, step)
+    gz = np.arange(min_z, max_z + step, step)
+    GX, GZ = np.meshgrid(gx, gz, indexing="ij")
+    flat = np.column_stack([GX.ravel(), GZ.ravel()])
+    d_ref, near_flat = kd_ref.query(flat)
+    keep = (d_ref > TERRAIN_MAX_DIST - step) & (d_ref <= FAR_MAX_DIST)
+    nodes = flat[keep]
+    near = near_flat[keep].astype(int)
+    if len(nodes) < 3:
+        return []
+
+    latlon = [list(inv_ll(float(x), float(z))) for x, z in nodes]
+    print(f"  [terrain] sampling {len(nodes)} far-terrain DEM points "
+          f"(ring {TERRAIN_MAX_DIST:.0f}–{FAR_MAX_DIST:.0f}m, "
+          f"{step:.0f}m grid)…")
+    elevs = np.array(fetch_elevations(latlon), dtype=float)
+    bad = ~np.isfinite(elevs)
+    if bad.any():
+        elevs[bad] = dem_ref[near[bad]]
+    ys = ry[near] - g_drop + (elevs - dem_ref[near]) - 0.6
+
+    tri = Delaunay(nodes)
+    max_edge2 = (2.8 * step) ** 2
+    out = []
+    verts, idx, vmap, part = [], [], {}, 0
+
+    def flush():
+        nonlocal verts, idx, vmap, part
+        if verts:
+            out.append((f"ENV_FAR_{part}", verts, idx, "terrain"))
+            part += 1
+            verts, idx, vmap = [], [], {}
+
+    def vid(k):
+        vi = vmap.get(k)
+        if vi is None:
+            x, z = float(nodes[k][0]), float(nodes[k][1])
+            vi = len(verts)
+            verts.append(((x, float(ys[k]), z), (0.0, 1.0, 0.0),
+                          (x / 20.0, z / 20.0), (1.0, 0.0, 0.0)))
+            vmap[k] = vi
+        return vi
+
+    for s in tri.simplices:
+        a, b, c = int(s[0]), int(s[1]), int(s[2])
+        pa, pb, pc = nodes[a], nodes[b], nodes[c]
+        if (((pa - pb) ** 2).sum() > max_edge2
+                or ((pb - pc) ** 2).sum() > max_edge2
+                or ((pa - pc) ** 2).sum() > max_edge2):
+            continue                       # spans the road corridor / a gap
+        if len(verts) + 3 > 60000:
+            flush()
+        va, vb, vc = vid(a), vid(b), vid(c)
+        # double-sided: no underlay copy is made for ENV_ meshes
+        idx.extend((va, vb, vc,  va, vc, vb))
+    flush()
+    return out
+
 def process_road(coords: list, road_width: float = 8.0,
                  smooth_factor: float = 0.3, elevations: list = None,
                  elev_profile: dict = None, grass_width: float = 10.0) -> dict:
@@ -3092,34 +3186,123 @@ def _png_encode(width: int, height: int, pixels: bytes, rgba: bool = False) -> b
 
 # ─── Procedural Textures ──────────────────────────────────────────────────────
 
-def build_road_texture(size: int = 256) -> bytes:
-    """Asphalt with edge lines and a dashed centre line. V axis = along road."""
-    rng = np.random.default_rng(42)
-    noise = rng.integers(-9, 9, size=(size, size, 1))
-    base = np.full((size, size, 3), (57, 57, 60), dtype=np.int16) + noise
-    img = np.clip(base, 0, 255).astype(np.uint8)
+def _pnoise(size: int, cells: int, rng) -> np.ndarray:
+    """Tileable value noise: a cells×cells random grid, bilinearly upsampled
+    with wrap-around, so the texture has no seam when tiled."""
+    g = rng.standard_normal((cells, cells))
+    gg = np.pad(g, ((0, 1), (0, 1)), mode='wrap')
+    t = np.linspace(0.0, cells, size, endpoint=False)
+    i = np.floor(t).astype(int)
+    f = t - i
+    a00 = gg[np.ix_(i,     i)];     a10 = gg[np.ix_(i + 1, i)]
+    a01 = gg[np.ix_(i,     i + 1)]; a11 = gg[np.ix_(i + 1, i + 1)]
+    fx = f[:, None]; fy = f[None, :]
+    return a00*(1-fx)*(1-fy) + a10*fx*(1-fy) + a01*(1-fx)*fy + a11*fx*fy
 
-    # White edge lines (~4% in from each edge)
+
+def _fbm(size: int, rng, octaves=((4, 1.0), (8, 0.55), (16, 0.3), (64, 0.15))) -> np.ndarray:
+    """Multi-octave tileable noise, roughly in [-1, 1]. Coarse octaves give
+    patchiness, fine ones give surface detail — single-octave noise is what
+    made the old ground textures read as flat colour."""
+    out = np.zeros((size, size))
+    total = 0.0
+    for cells, amp in octaves:
+        out += _pnoise(size, min(cells, size // 2), rng) * amp
+        total += amp
+    return out / (total * 1.6)
+
+
+ROAD_STYLES = ("sealed", "highway", "rural", "gravel")
+
+def _classify_road_style(road_type, surface) -> str:
+    """Map the selected road's OSM highway/surface tags to a texture style
+    (Australian conventions; other countries can hook in here later)."""
+    s = (surface or "").strip().lower()
+    if s in ("gravel", "unpaved", "dirt", "fine_gravel", "compacted",
+             "ground", "earth", "sand") or road_type == "track":
+        return "gravel"
+    if road_type in ("motorway", "trunk"):
+        return "highway"
+    if road_type in ("tertiary", "residential", "unclassified",
+                     "living_street", "service"):
+        return "rural"
+    return "sealed"           # primary/secondary/unknown
+
+
+def build_road_texture(size: int = 256, style: str = "sealed") -> bytes:
+    """Drivable-road surface in Australian marking conventions, chosen by the
+    selected road's OSM highway/surface tags. U axis = across road, V = along.
+      sealed  — primary/secondary: white edge lines + dashed white centre
+                line (AU centre lines are white, not yellow)
+      highway — motorway/trunk: fresher darker asphalt, denser centre dashes
+      rural   — minor sealed roads: aged patchy bitumen, faded edge lines,
+                NO centre line (typical narrow country roads)
+      gravel  — unsealed/track: red-brown laterite with compacted wheel
+                tracks and stone speckle, no markings
+    """
+    rng = np.random.default_rng(42)
+    lum = _fbm(size, rng)
+    xs = np.arange(size)
+
+    if style == "gravel":
+        img = np.empty((size, size, 3), dtype=np.float64)
+        img[:, :, 0] = 148 + lum * 26
+        img[:, :, 1] = 106 + lum * 22
+        img[:, :, 2] = 76 + lum * 18
+        for cx_f in (0.30, 0.70):          # compacted wheel tracks: lighter
+            wtd = np.exp(-((xs / size - cx_f) / 0.055) ** 2)
+            img += wtd[None, :, None] * np.array([16.0, 14.0, 12.0])
+        dark = rng.random((size, size)) < 0.02      # stone speckle
+        lite = rng.random((size, size)) < 0.015
+        img[dark] -= 34
+        img[lite] += 30
+        return _png_encode(size, size,
+                           np.clip(img, 0, 255).astype(np.uint8).tobytes())
+
+    base = {"sealed": (57, 57, 60), "highway": (48, 48, 53),
+            "rural": (74, 73, 74)}.get(style, (57, 57, 60))
+    img = np.empty((size, size, 3), dtype=np.float64)
+    amp = 26 if style == "rural" else 12            # old bitumen is patchier
+    for ch in range(3):
+        img[:, :, ch] = base[ch] + lum * amp
+    if style == "rural":                            # darker patch repairs
+        patch = _fbm(size, rng, octaves=((3, 1.0), (6, 0.5)))
+        img -= np.clip((patch - 0.25) * 3.0, 0, 1)[:, :, None] * 18.0
+    for cx_f in (0.30, 0.70):                       # tyre-polished strips
+        wtd = np.exp(-((xs / size - cx_f) / 0.07) ** 2)
+        img -= wtd[None, :, None] * 6.0
+    img = np.clip(img, 0, 255).astype(np.uint8)
+
+    # Edge lines (faded on rural)
     e0 = max(2, size // 26)
     ew = max(2, size // 64)
-    img[:, e0:e0 + ew, :] = 225
-    img[:, size - e0 - ew:size - e0, :] = 225
+    edge_c = 170 if style == "rural" else 225
+    img[:, e0:e0 + ew, :] = edge_c
+    img[:, size - e0 - ew:size - e0, :] = edge_c
 
-    # Dashed white centre line (painted on half the tile → dashes when tiled)
-    c = size // 2
-    half = size // 2
-    cw = max(1, size // 128)
-    img[0:half, c - cw - 1:c + cw + 1, :] = 210
+    # Dashed white centre line — none on rural back roads
+    if style != "rural":
+        c = size // 2
+        cw = max(1, size // 128)
+        dash = int(size * (0.6 if style == "highway" else 0.5))
+        img[0:dash, c - cw - 1:c + cw + 1, :] = 210
 
     return _png_encode(size, size, img.tobytes())
 
 
-def build_grass_texture(size: int = 128) -> bytes:
+def build_grass_texture(size: int = 256) -> bytes:
+    """Mown verge grass: fBm luminance patches, a second fBm shifting hue
+    between yellow-green and blue-green, and sparse bright blade speckles."""
     rng = np.random.default_rng(7)
-    noise = rng.integers(-14, 14, size=(size, size, 1))
-    base = np.full((size, size, 3), (66, 105, 48), dtype=np.int16) + noise
-    img = np.clip(base, 0, 255).astype(np.uint8)
-    return _png_encode(size, size, img.tobytes())
+    lum  = _fbm(size, rng)
+    hue  = _fbm(size, rng, octaves=((3, 1.0), (9, 0.5)))
+    img = np.empty((size, size, 3), dtype=np.int16)
+    img[:, :, 0] = 64 + lum * 22 + hue * 12
+    img[:, :, 1] = 102 + lum * 26 + hue * 9
+    img[:, :, 2] = 46 + lum * 16 - hue * 10
+    speck = rng.random((size, size)) < 0.012
+    img[speck] = np.clip(img[speck] + 34, 0, 255)
+    return _png_encode(size, size, np.clip(img, 0, 255).astype(np.uint8).tobytes())
 
 
 def build_building_texture(size: int = 128) -> bytes:
@@ -3157,13 +3340,77 @@ def build_building2_texture(size: int = 128) -> bytes:
     return _png_encode(size, size, img.tobytes())
 
 
-def build_tree2_texture(size: int = 64) -> bytes:
-    """Dark olive conifer canopy, same two-octave clumping."""
+def build_building3_texture(size: int = 128) -> bytes:
+    """Pale sage painted-render house wall, same sparse window row — a third
+    house variant so streets don't alternate two walls A/B/A/B."""
+    rng = np.random.default_rng(61)
+    noise = rng.integers(-6, 6, size=(size, size, 1))
+    base = np.full((size, size, 3), (196, 200, 184), dtype=np.int16) + noise
+    img = np.clip(base, 0, 255).astype(np.uint8)
+    wy0, wh, ww, step = size//2 - 11, 22, 16, 44
+    for wx in range(10, size - ww, step):
+        img[wy0-2:wy0+wh+2, wx-2:wx+ww+2, :] = (232, 230, 222)
+        img[wy0:wy0+wh, wx:wx+ww, :] = (58, 72, 88)
+        img[wy0+wh//2:wy0+wh//2+2, wx:wx+ww, :] = (232, 230, 222)
+    return _png_encode(size, size, img.tobytes())
+
+
+def build_commercial_texture(size: int = 128) -> bytes:
+    """Commercial/large-building wall: concrete panels with a full-width
+    glazing band. One texture tile = one storey (wall UVs tile vertically
+    per ~3.2m of height), so tall buildings get a window band per floor."""
+    rng = np.random.default_rng(71)
+    noise = rng.integers(-6, 6, size=(size, size, 1))
+    base = np.full((size, size, 3), (168, 166, 160), dtype=np.int16) + noise
+    img = np.clip(base, 0, 255).astype(np.uint8)
+    for by in range(0, size, size // 4):              # panel joints
+        img[by:by+1, :, :] = np.clip(img[by:by+1, :, :].astype(int) - 24, 0, 255)
+    wy0, wh = size//2 - 16, 34                        # glazing band
+    img[wy0-2:wy0+wh+2, :, :] = (188, 188, 184)       # frame strip
+    img[wy0:wy0+wh, :, :] = (52, 64, 82)              # glass
+    for wx in range(0, size, 22):                     # mullions
+        img[wy0:wy0+wh, wx:wx+2, :] = (150, 150, 148)
+    return _png_encode(size, size, img.tobytes())
+
+
+def build_tree2_texture(size: int = 256) -> bytes:
+    """Conifer impostor: RGBA silhouette of stacked drooping tiers over a
+    short trunk, dark olive, ragged alpha edge. Image top = tree top."""
+    from scipy.ndimage import binary_erosion
     rng = np.random.default_rng(41)
-    coarse = np.kron(rng.integers(-20, 20, size=(8, 8, 1)), np.ones((8, 8, 1)))
-    fine = rng.integers(-12, 12, size=(size, size, 1))
-    base = np.full((size, size, 3), (48, 70, 42), dtype=np.int16) + coarse + fine
-    return _png_encode(size, size, np.clip(base, 0, 255).astype(np.uint8).tobytes())
+    yy, xx = np.mgrid[0:size, 0:size].astype(float)
+    cx = size / 2.0
+
+    canopy = np.zeros((size, size), dtype=bool)
+    top, bot = 0.03, 0.88                       # canopy vertical extent
+    tiers = 7
+    for row in range(int(size * top), int(size * bot)):
+        t = (row / size - top) / (bot - top)    # 0 at tip → 1 at base
+        tier_ph = (t * tiers) % 1.0             # sawtooth per tier
+        w = size * 0.40 * (0.12 + 0.88 * t) * (1.0 - 0.32 * tier_ph)
+        w *= rng.uniform(0.92, 1.08)
+        canopy[row, int(cx - w):int(cx + w)] = True
+
+    trunk = np.zeros((size, size), dtype=bool)
+    hwd = int(size * 0.022)
+    trunk[int(size * 0.80):, int(cx - hwd):int(cx + hwd)] = True
+
+    alpha = canopy | trunk
+    edge = alpha & ~binary_erosion(alpha, iterations=2)
+    alpha &= ~(edge & (rng.random((size, size)) < 0.5))
+
+    lum = _fbm(size, rng)
+    img = np.empty((size, size, 4), dtype=np.float64)
+    depth = np.clip((yy / size - 0.1) * 1.2, 0, 1)
+    img[:, :, 0] = 48 + lum * 22 - depth * 12
+    img[:, :, 1] = 72 + lum * 26 - depth * 18
+    img[:, :, 2] = 44 + lum * 16 - depth * 10
+    tv = trunk & ~canopy
+    img[tv, 0] = 82; img[tv, 1] = 62; img[tv, 2] = 46
+    img[:, :, 3] = np.where(alpha, 255, 0)
+    return _png_encode(size, size,
+                       np.clip(img, 0, 255).astype(np.uint8).tobytes(),
+                       rgba=True)
 
 
 def build_asphalt_texture(size: int = 128) -> bytes:
@@ -3185,30 +3432,87 @@ def build_roof_texture(size: int = 64) -> bytes:
     return _png_encode(size, size, img.tobytes())
 
 
-def build_tree_texture(size: int = 64) -> bytes:
-    """Mid-green broadleaf canopy: coarse foliage clumps over fine leaf
-    noise — flat single-octave noise is what made trees look cartoony."""
+def build_tree_texture(size: int = 256) -> bytes:
+    """Broadleaf tree impostor: full RGBA silhouette (trunk + branches +
+    clumped canopy) with a ragged alpha edge, for alpha-tested cross-plane
+    quads. Image top = tree top (DirectX v=0 at the top of the image).
+    RGB is filled with canopy green everywhere so bilinear sampling never
+    pulls dark halo pixels in from transparent texels."""
+    from scipy.ndimage import binary_erosion
     rng = np.random.default_rng(23)
-    coarse = np.kron(rng.integers(-26, 26, size=(8, 8, 1)), np.ones((8, 8, 1)))
-    fine = rng.integers(-10, 10, size=(size, size, 1))
-    base = np.full((size, size, 3), (74, 104, 56), dtype=np.int16) + coarse + fine
-    return _png_encode(size, size, np.clip(base, 0, 255).astype(np.uint8).tobytes())
+    yy, xx = np.mgrid[0:size, 0:size].astype(float)
+    cx = size / 2.0
+
+    # Canopy: union of many discs biased into an ellipse in the upper part
+    canopy = np.zeros((size, size), dtype=bool)
+    for _ in range(70):
+        ang = rng.uniform(0, 2 * math.pi)
+        rad = rng.uniform(0, 1) ** 0.55
+        ex = cx + math.cos(ang) * rad * size * 0.36
+        ey = size * 0.34 + math.sin(ang) * rad * size * 0.26
+        r = rng.uniform(0.05, 0.13) * size
+        canopy |= (xx - ex) ** 2 + (yy - ey) ** 2 < r * r
+
+    # Trunk: tapering column from the ground up into the canopy
+    trunk = np.zeros((size, size), dtype=bool)
+    for row in range(int(size * 0.40), size):
+        t = (row - size * 0.40) / (size * 0.60)
+        hwd = (0.013 + 0.030 * t) * size
+        trunk[row, int(cx - hwd):int(cx + hwd)] = True
+    # Two branches reaching into the canopy
+    for sgn in (-1, 1):
+        for step in range(int(size * 0.22)):
+            row = int(size * 0.52) - step
+            col = int(cx + sgn * step * 0.7)
+            if 0 <= row < size and 2 <= col < size - 2:
+                trunk[row, col - 2:col + 2] = True
+
+    alpha = canopy | trunk
+    # Ragged leafy edge: randomly knock pixels out of the boundary band
+    edge = alpha & ~binary_erosion(alpha, iterations=2)
+    alpha &= ~(edge & (rng.random((size, size)) < 0.45))
+
+    # Colour: green everywhere (halo-safe), shaded by clump + fine noise,
+    # darker toward the canopy underside; trunk painted brown on top.
+    lum = _fbm(size, rng)
+    img = np.empty((size, size, 4), dtype=np.float64)
+    depth = np.clip((yy / size - 0.15) * 1.4, 0, 1)          # darker lower
+    img[:, :, 0] = 62 + lum * 30 - depth * 16
+    img[:, :, 1] = 96 + lum * 34 - depth * 22
+    img[:, :, 2] = 48 + lum * 20 - depth * 12
+    tv = trunk & ~binary_erosion(canopy, iterations=4)
+    img[tv] = np.column_stack([np.full(tv.sum(), 88.0) + lum[tv] * 20,
+                               np.full(tv.sum(), 66.0) + lum[tv] * 14,
+                               np.full(tv.sum(), 48.0) + lum[tv] * 10,
+                               np.zeros(tv.sum())])
+    img[:, :, 3] = np.where(alpha, 255, 0)
+    return _png_encode(size, size,
+                       np.clip(img, 0, 255).astype(np.uint8).tobytes(),
+                       rgba=True)
 
 
-def build_forest_texture(size: int = 128) -> bytes:
-    """Dark leaf-litter floor for tree-covered ground."""
+def build_forest_texture(size: int = 256) -> bytes:
+    """Dark leaf-litter floor: fBm shade + brown litter speckle."""
     rng = np.random.default_rng(41)
-    noise = rng.integers(-16, 16, size=(size, size, 1))
-    base = np.full((size, size, 3), (48, 66, 38), dtype=np.int16) + noise
-    return _png_encode(size, size, np.clip(base, 0, 255).astype(np.uint8).tobytes())
+    lum = _fbm(size, rng)
+    img = np.empty((size, size, 3), dtype=np.int16)
+    img[:, :, 0] = 46 + lum * 18
+    img[:, :, 1] = 62 + lum * 20
+    img[:, :, 2] = 36 + lum * 12
+    speck = rng.random((size, size)) < 0.02
+    img[speck] = (86, 70, 48)
+    return _png_encode(size, size, np.clip(img, 0, 255).astype(np.uint8).tobytes())
 
 
-def build_dirt_texture(size: int = 128) -> bytes:
-    """Bare / built-up ground: dry earth."""
+def build_dirt_texture(size: int = 256) -> bytes:
+    """Bare / built-up ground: dry earth with fBm mottling."""
     rng = np.random.default_rng(53)
-    noise = rng.integers(-14, 14, size=(size, size, 1))
-    base = np.full((size, size, 3), (134, 112, 86), dtype=np.int16) + noise
-    return _png_encode(size, size, np.clip(base, 0, 255).astype(np.uint8).tobytes())
+    lum = _fbm(size, rng)
+    img = np.empty((size, size, 3), dtype=np.int16)
+    img[:, :, 0] = 132 + lum * 24
+    img[:, :, 1] = 110 + lum * 20
+    img[:, :, 2] = 84 + lum * 16
+    return _png_encode(size, size, np.clip(img, 0, 255).astype(np.uint8).tobytes())
 
 
 def build_water_texture(size: int = 128) -> bytes:
@@ -3218,13 +3522,19 @@ def build_water_texture(size: int = 128) -> bytes:
     return _png_encode(size, size, np.clip(base, 0, 255).astype(np.uint8).tobytes())
 
 
-def build_terrain_texture(size: int = 128) -> bytes:
-    """Scrubbier, browner green than the mown verge grass."""
+def build_terrain_texture(size: int = 256) -> bytes:
+    """Scrubby hillside: green base with dry-earth patches where the coarse
+    noise peaks, so open ground reads as mottled paddock rather than felt."""
     rng = np.random.default_rng(31)
-    noise = rng.integers(-20, 20, size=(size, size, 1))
-    base = np.full((size, size, 3), (74, 92, 52), dtype=np.int16) + noise
-    img = np.clip(base, 0, 255).astype(np.uint8)
-    return _png_encode(size, size, img.tobytes())
+    lum = _fbm(size, rng)
+    patch = _fbm(size, rng, octaves=((3, 1.0), (6, 0.6)))
+    img = np.empty((size, size, 3), dtype=np.float64)
+    img[:, :, 0] = 82 + lum * 26
+    img[:, :, 1] = 96 + lum * 26
+    img[:, :, 2] = 54 + lum * 16
+    w = np.clip((patch - 0.18) * 3.0, 0.0, 1.0)[:, :, None]   # dry patches
+    img = img * (1 - w) + np.array([126.0, 108.0, 76.0]) * w
+    return _png_encode(size, size, np.clip(img, 0, 255).astype(np.uint8).tobytes())
 
 
 # ─── Track Map (map.png + map.ini + ui images) ────────────────────────────────
@@ -3325,11 +3635,12 @@ class _KN5:
             self.f32(vec[0]); self.f32(vec[1]); self.f32(vec[2]); self.f32(w)
 
     def material(self, name, shader, texture_name,
-                 ambient=0.5, diffuse=0.45, specular=0.05, spec_exp=20.0):
+                 ambient=0.5, diffuse=0.45, specular=0.05, spec_exp=20.0,
+                 alpha_tested=False):
         self.s(name)
         self.s(shader)
         self.byte(0)      # alphaBlendMode: Opaque
-        self.flag(False)  # alphaTested
+        self.flag(alpha_tested)   # alphaTested (cutout, e.g. tree impostors)
         self.i32(0)       # depthMode: DepthNormal
         props = [("ksAmbient", ambient), ("ksDiffuse", diffuse),
                  ("ksSpecular", specular), ("ksSpecularEXP", spec_exp)]
@@ -3468,7 +3779,8 @@ def build_kn5(mesh: dict, track_name: str, env_meshes: list = None,
     k.u32(5)                                   # file version
 
     # ── Textures ──
-    textures = [("road.png",     build_road_texture()),
+    textures = [("road.png",     build_road_texture(
+                                     style=mesh.get("road_style", "sealed"))),
                 ("grass.png",    build_grass_texture()),
                 ("building.png", build_building_texture()),
                 ("tree.png",     build_tree_texture()),
@@ -3479,7 +3791,9 @@ def build_kn5(mesh: dict, track_name: str, env_meshes: list = None,
                 ("roof.png",      build_roof_texture()),
                 ("asphalt.png",   build_asphalt_texture()),
                 ("building2.png", build_building2_texture()),
-                ("tree2.png",     build_tree2_texture())]
+                ("tree2.png",     build_tree2_texture()),
+                ("building3.png",  build_building3_texture()),
+                ("commercial.png", build_commercial_texture())]
     k.i32(len(textures))
     for tex_name, data in textures:
         k.i32(1)                               # active
@@ -3489,12 +3803,17 @@ def build_kn5(mesh: dict, track_name: str, env_meshes: list = None,
     # ── Materials ──
     mat_ids = {"road": 0, "grass": 1, "building": 2, "tree": 3, "terrain": 4,
                "forest": 5, "dirt": 6, "water": 7, "roof": 8, "asphalt": 9,
-               "building2": 10, "tree2": 11}
-    k.i32(12)
-    k.material("road",     "ksPerPixel", "road.png",     specular=0.08, spec_exp=30.0)
+               "building2": 10, "tree2": 11, "building3": 12, "commercial": 13}
+    k.i32(14)
+    _road_style = mesh.get("road_style", "sealed")
+    if _road_style == "gravel":               # dirt, not polished bitumen
+        k.material("road", "ksPerPixel", "road.png", specular=0.02, spec_exp=8.0)
+    else:
+        k.material("road", "ksPerPixel", "road.png", specular=0.08, spec_exp=30.0)
     k.material("grass",    "ksPerPixel", "grass.png",    specular=0.01, spec_exp=5.0)
     k.material("building", "ksPerPixel", "building.png", specular=0.03, spec_exp=10.0)
-    k.material("tree",     "ksPerPixel", "tree.png",     specular=0.01, spec_exp=5.0)
+    k.material("tree",     "ksPerPixel", "tree.png",     specular=0.01, spec_exp=5.0,
+               alpha_tested=True)
     k.material("terrain",  "ksPerPixel", "terrain.png",  specular=0.01, spec_exp=5.0)
     k.material("forest",   "ksPerPixel", "forest.png",   specular=0.01, spec_exp=5.0)
     k.material("dirt",     "ksPerPixel", "dirt.png",     specular=0.01, spec_exp=5.0)
@@ -3502,7 +3821,10 @@ def build_kn5(mesh: dict, track_name: str, env_meshes: list = None,
     k.material("roof",     "ksPerPixel", "roof.png",     specular=0.02, spec_exp=8.0)
     k.material("asphalt",  "ksPerPixel", "asphalt.png",  specular=0.06, spec_exp=25.0)
     k.material("building2","ksPerPixel", "building2.png",specular=0.03, spec_exp=10.0)
-    k.material("tree2",    "ksPerPixel", "tree2.png",    specular=0.01, spec_exp=5.0)
+    k.material("tree2",    "ksPerPixel", "tree2.png",    specular=0.01, spec_exp=5.0,
+               alpha_tested=True)
+    k.material("building3", "ksPerPixel", "building3.png",  specular=0.03, spec_exp=10.0)
+    k.material("commercial","ksPerPixel", "commercial.png", specular=0.05, spec_exp=14.0)
 
     # ── Geometry ──
     cl = mesh["centerline"]
@@ -3545,6 +3867,8 @@ def build_kn5(mesh: dict, track_name: str, env_meshes: list = None,
     # prefix and no surface key, so they have no physics.
     underlay_id = 0
     for name, kv, idx, mat_id in list(meshes):
+        if name.startswith("ENV_"):
+            continue                    # already double-sided, no physics
         u_kv = [((p[0], p[1] - 0.03, p[2]), (-n[0], -n[1], -n[2]), uv, t)
                 for p, n, uv, t in kv]
         u_idx = []
@@ -3803,7 +4127,9 @@ def export_ac_package(coords: list, road_width: float,
                       install_path: str = None,
                       include_env: bool = True,
                       max_grade: float = None,
-                      monotonic: bool = False) -> dict:
+                      monotonic: bool = False,
+                      road_type: str = None,
+                      road_surface: str = None) -> dict:
     # Elevation and land cover are required, not optional. If they can't be
     # obtained the export fails with the reason — a flat or untextured track
     # looks plausible but is wrong, which is worse than a clear failure.
@@ -3823,6 +4149,9 @@ def export_ac_package(coords: list, road_width: float,
                         elev_profile=elev_profile, grass_width=0.0)
     if "error" in mesh:
         return mesh
+    mesh["road_style"] = _classify_road_style(road_type, road_surface)
+    print(f"  [export] Road style: {mesh['road_style']} "
+          f"(highway={road_type}, surface={road_surface})")
 
     # ── Land cover (ESA WorldCover): surface type + vegetation everywhere,
     #    including where OpenStreetMap has no polygons drawn. ──
@@ -3857,6 +4186,18 @@ def export_ac_package(coords: list, road_width: float,
     ground_pts += list(mesh["centerline"])
     print(f"  [export] Real terrain: "
           f"{sum(len(kv) for _, kv, _, _ in terrain_meshes)} verts")
+
+    # Coarse visual-only backdrop ring, so distant road sections sit on
+    # hills instead of void. Added after ground_pts so the environment's
+    # ground lookup keeps only the fine grid.
+    try:
+        far_meshes = build_far_terrain(mesh, tgrid)
+        if far_meshes:
+            terrain_meshes = terrain_meshes + far_meshes
+            print(f"  [export] Far terrain: "
+                  f"{sum(len(kv) for _, kv, _, _ in far_meshes)} verts")
+    except Exception as e:
+        print(f"  [export] Far terrain skipped: {e}")
 
     env_meshes = None
     n_bldg = n_tree = 0
@@ -4041,7 +4382,9 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(export_ac_package(coords, rw, sm, name,
                                              install_path, include_env,
                                              max_grade=mg,
-                                             monotonic=bool(body.get("monotonic", False))))
+                                             monotonic=bool(body.get("monotonic", False)),
+                                             road_type=body.get("road_type"),
+                                             road_surface=body.get("road_surface")))
 
         elif parsed.path == "/api/preview":
             coords = body.get("coords", [])

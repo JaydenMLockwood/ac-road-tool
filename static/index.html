@@ -886,6 +886,8 @@ async function selectResult(result, el) {
 // Apply a geometry response to the map + enter start/end selection mode
 function applyGeometry(data) {
   state.coords = data.coords;
+  state.roadType = data.road_type || null;       // OSM highway= tag
+  state.roadSurface = data.road_surface || null; // OSM surface= tag
   drawRoad(data.coords);
 
   setLocked(false);
@@ -1200,6 +1202,8 @@ async function doExport() {
         monotonic: document.getElementById('monoChk').checked,
         track_name: trackName,
         install_path: document.getElementById('acPath').value.trim() || null,
+        road_type: state.roadType || null,
+        road_surface: state.roadSurface || null,
       }),
     });
     const data = await res.json();
