@@ -5,6 +5,7 @@ OSM road data → elevation → FBX with AC markers → Assetto Corsa track zip
 """
 
 import json, math, os, shutil, struct, time, zipfile, io
+import threading, queue
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs, urlencode
 from urllib.request import urlopen, Request
@@ -58,58 +59,86 @@ def search_osm_roads(query: str) -> dict:
 
 OVERPASS_ENDPOINTS = [
     "https://overpass-api.de/api/interpreter",
-    "https://overpass.kumi.systems/api/interpreter",
     "https://lz4.overpass-api.de/api/interpreter",
     "https://z.overpass-api.de/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter",
     "https://overpass.private.coffee/api/interpreter",
 ]
 
 
-_overpass_start = 0     # rotates so we don't always hammer the same mirror
+_overpass_good = None   # last mirror that answered — always tried first
 
 
 def _overpass(q: str, timeout: int = 40):
     """
-    Run an Overpass query. Mirrors are tried in a rotating order so repeated
-    queries in one export don't all pile onto the same (usually busiest)
-    instance; several passes with growing backoff ride out the frequent
-    windows where every public mirror is briefly overloaded — 429/504 means
-    "busy", not "broken". Overpass has a second overload mode that is easy
-    to miss: HTTP 200 with a TRUNCATED result and a "remark" saying the
-    query timed out server-side. Accepting that silently produces exports with
-    mysteriously missing barriers/vegetation, so a remark is treated exactly
-    like a busy mirror.
-    """
-    global _overpass_start
-    n = len(OVERPASS_ENDPOINTS)
-    order = [OVERPASS_ENDPOINTS[(_overpass_start + i) % n] for i in range(n)]
-    _overpass_start = (_overpass_start + 1) % n
+    Run an Overpass query with HEDGED parallel requests. The last-known-good
+    mirror fires immediately; another mirror joins the race every few seconds
+    (or the moment one fails), and the first success wins. Sequential
+    mirror-walking meant a run of dead mirrors cost their full read timeouts
+    stacked end to end — minutes per call — and the old rotation actively
+    moved the working mirror away from the front.
 
+    Overpass has a second overload mode that is easy to miss: HTTP 200 with a
+    TRUNCATED result and a "remark" saying the query timed out server-side.
+    Accepting that silently produces exports with mysteriously missing
+    barriers/vegetation, so a remark is treated exactly like a busy mirror.
+    """
+    global _overpass_good
+    order = list(OVERPASS_ENDPOINTS)
+    if _overpass_good in order:
+        order.remove(_overpass_good)
+        order.insert(0, _overpass_good)
+
+    def one(url):
+        req = Request(
+            url,
+            data=urlencode({"data": q}).encode(),
+            headers={"User-Agent": "AC-Road-Tool/1.0",
+                     "Content-Type": "application/x-www-form-urlencoded"})
+        with urlopen(req, timeout=timeout) as r:
+            data = json.loads(r.read())
+        remark = str(data.get("remark", "")).lower()
+        if remark and any(w in remark for w in
+                          ("timed out", "timeout", "error",
+                           "out of memory", "load")):
+            raise IOError(f"partial result: {remark[:70]}")
+        return data
+
+    STAGGER = 5.0           # seconds before the next mirror joins the race
+    waits = (3.0, 8.0)
     last = None
-    waits = (3.0, 8.0, 15.0)
     for attempt in range(len(waits) + 1):
-        for url in order:
+        results = queue.Queue()
+
+        def worker(url, _rq=results):
             try:
-                req = Request(
-                    url,
-                    data=urlencode({"data": q}).encode(),
-                    headers={"User-Agent": "AC-Road-Tool/1.0",
-                             "Content-Type": "application/x-www-form-urlencoded"}
-                )
-                with urlopen(req, timeout=timeout) as r:
-                    data = json.loads(r.read())
-                remark = str(data.get("remark", "")).lower()
-                if remark and any(w in remark for w in
-                                  ("timed out", "timeout", "error",
-                                   "out of memory", "load")):
-                    raise IOError(f"partial result: {remark[:70]}")
-                return data
+                _rq.put((url, one(url), None))
             except Exception as e:
-                last = e
-                busy = any(c in str(e) for c in
-                           ("429", "504", "503", "partial result"))
-                print(f"  [overpass] {url.split('/')[2]} "
-                      f"{'busy' if busy else 'failed'} ({e}) — next mirror")
+                _rq.put((url, None, e))
+
+        started = finished = 0
+        next_start = time.monotonic()
+        while finished < len(order):
+            now = time.monotonic()
+            if started < len(order) and now >= next_start:
+                threading.Thread(target=worker, args=(order[started],),
+                                 daemon=True).start()
+                started += 1
+                next_start = now + STAGGER
+            try:
+                url, data, err = results.get(timeout=0.25)
+            except queue.Empty:
+                continue
+            if err is None:
+                _overpass_good = url          # pin the winner for next time
+                return data
+            finished += 1
+            last = err
+            busy = any(c in str(err) for c in
+                       ("429", "504", "503", "partial result"))
+            print(f"  [overpass] {url.split('/')[2]} "
+                  f"{'busy' if busy else 'failed'} ({err}) — racing next")
+            next_start = time.monotonic()     # a failure frees the next slot
         if attempt < len(waits):
             print(f"  [overpass] all mirrors busy — waiting "
                   f"{waits[attempt]:.0f}s and retrying "
@@ -282,9 +311,9 @@ def fetch_road_geometry(osm_type: str, osm_id: str) -> dict:
 
     try:
         if osm_type == "way":
-            data = _overpass(f"[out:json];way({osm_id});out geom;")
+            data = _overpass(f"[out:json];way({osm_id});out geom;", timeout=20)
         elif osm_type == "relation":
-            data = _overpass(f"[out:json];relation({osm_id});way(r);out geom;")
+            data = _overpass(f"[out:json];relation({osm_id});way(r);out geom;", timeout=20)
         else:
             return {"error": "Unsupported OSM type", "coords": []}
     except Exception as e:
@@ -319,7 +348,7 @@ def fetch_road_geometry(osm_type: str, osm_id: str) -> dict:
                  f"({bbox[0]:.4f},{bbox[1]:.4f},{bbox[2]:.4f},{bbox[3]:.4f});"
                  f"out geom;")
             try:
-                more = _overpass(q)
+                more = _overpass(q, timeout=35)
                 more_els = [el for el in more.get("elements", [])
                             if el.get("type") == "way" and "geometry" in el]
                 if len(more_els) > len(elements):
@@ -385,10 +414,11 @@ def fetch_surroundings(coords: list, radius_m: float = 60.0) -> dict:
         try:
             with open(cache_path) as f:
                 cached = json.load(f)
-            print(f"  [surroundings] cache hit "
-                  f"({len(cached.get('buildings', []))} buildings, "
-                  f"{len(cached.get('barriers', []))} barriers)")
-            return cached
+            if cached.get("roads"):     # empty-roads cache = poisoned, refetch
+                print(f"  [surroundings] cache hit "
+                      f"({len(cached.get('buildings', []))} buildings, "
+                      f"{len(cached.get('barriers', []))} barriers)")
+                return cached
         except Exception:
             pass
     complete = True
@@ -546,7 +576,7 @@ def fetch_surroundings(coords: list, radius_m: float = 60.0) -> dict:
 
     # Caps to keep the KN5 sane
     out["buildings"] = out["buildings"][:800]
-    out["trees"]     = out["trees"][:4000]
+    out["trees"]     = out["trees"][:8000]
     out["forests"]   = out["forests"][:300]
     out["roads"]     = out["roads"][:400]
     out["waterways"] = out["waterways"][:200]
@@ -557,6 +587,12 @@ def fetch_surroundings(coords: list, radius_m: float = 60.0) -> dict:
           f"{len(out['waterways'])} waterways, {len(out['barriers'])} barriers, "
           f"{len(out['forests'])} vegetation "
           f"areas (max density {max(dens) if dens else 0})")
+    if not out["roads"]:
+        # The drivable road itself lies inside the query radius, so a valid
+        # result can never contain zero roads — a regional or overloaded
+        # mirror answered with an empty 200. Fail loudly, never cache.
+        raise IOError("surroundings response was empty (bad Overpass "
+                      "mirror?) — try the export again")
     if complete:
         try:
             os.makedirs(os.path.dirname(cache_path), exist_ok=True)
@@ -650,6 +686,15 @@ def _ear_clip(pts: list) -> list:
     elif not tris:
         tris = [(0, i, i+1) for i in range(1, n-1)]   # degenerate: fan fallback
     return tris
+
+
+
+SIDE_ROAD_W = {"motorway": 11.0, "trunk": 10.0, "primary": 8.0,
+               "secondary": 7.0, "tertiary": 6.5, "residential": 5.5,
+               "unclassified": 5.5, "living_street": 5.0, "service": 4.0,
+               "track": 3.0}
+WATER_W   = {"river": 8.0, "canal": 6.0, "stream": 2.5,
+             "drain": 1.5, "ditch": 1.2}
 
 
 def build_environment_meshes(surroundings: dict, mesh: dict,
@@ -757,13 +802,22 @@ def build_environment_meshes(surroundings: dict, mesh: dict,
     if lc_latlon is None:
         lc_fn = None
 
-    if (forests or lc_fn) and len(tree_pts) < 4000:
+    # Cap scales with track length — a fixed cap left the far end of long
+    # tracks bare once it filled up near the start. Stations are also
+    # visited in SHUFFLED order, so if the cap is ever hit the thinning is
+    # uniform along the whole road rather than front-loaded.
+    # These are NOT engine limits — the KN5 65535-verts-per-mesh cap is
+    # already handled by chunking. They bound file size and build time
+    # (~17 verts/tree incl. shadow → 30k trees ≈ 510k verts ≈ ~22MB).
+    tree_cap = min(30000, max(6000,
+                   int(mesh["stats"].get("length_km", 5.0) * 1600)))
+    if (forests or lc_fn) and len(tree_pts) < tree_cap:
         rng = np.random.default_rng(99)
         min_lat = hw + 4.0          # keep off road and verge
         max_lat = TERRAIN_MAX_DIST - 5.0   # plant right out to the terrain edge
-        step = 8                     # try planting every 8m of road
-        for ci in range(0, len(cl), step):
-            if len(tree_pts) >= 4000:
+        step = 6                     # try planting every 6m of road
+        for ci in rng.permutation(np.arange(0, len(cl), step)):
+            if len(tree_pts) >= tree_cap:
                 break
             p = cl[ci]
             pn = cl[min(ci + 1, len(cl) - 1)]
@@ -781,7 +835,6 @@ def build_environment_meshes(surroundings: dict, mesh: dict,
                         if bb[0] <= x <= bb[2] and bb[1] <= z <= bb[3] \
                            and rng.random() < density \
                            and in_poly(x, z, poly):
-                            tree_pts.append((x, z))
                             placed = True
                             break
                     # No OSM polygon here — ask WorldCover what the ground
@@ -790,8 +843,20 @@ def build_environment_meshes(surroundings: dict, mesh: dict,
                     if not placed and lc_fn is not None:
                         la, lo = lc_latlon(x, z)
                         dns = LC_TREE_DENSITY.get(lc_fn(la, lo), 0.0)
-                        if dns > 0 and rng.random() < dns:
-                            tree_pts.append((x, z))
+                        placed = dns > 0 and rng.random() < dns
+                    if placed:
+                        tree_pts.append((x, z))
+                        # Clumping: uniform scatter reads as "sprinkled";
+                        # real woodland grows in clusters. Satellites spread
+                        # only AWAY from the road; the clearance pass below
+                        # still backstops everything.
+                        if lat_d > min_lat + 8.0 and rng.random() < 0.55:
+                            for _s in range(int(rng.integers(1, 4))):
+                                s_lat = rng.uniform(0.0, 6.0)
+                                s_alg = rng.uniform(-7.0, 7.0)
+                                tree_pts.append((
+                                    x + side * px_ * s_lat + dx / L * s_alg,
+                                    z + side * pz_ * s_lat + dz / L * s_alg))
 
     # ── Road clearance ──
     # Nothing may stand on the carriageway: OSM tree nodes are often mapped
@@ -962,12 +1027,6 @@ def build_environment_meshes(surroundings: dict, mesh: dict,
     # (the arnis approach: render every linear feature the query returns.)
     # All visual-only — no digit prefix → no physics, so none of these can
     # reintroduce collision spikes.
-    SIDE_ROAD_W = {"motorway": 11.0, "trunk": 10.0, "primary": 8.0,
-                   "secondary": 7.0, "tertiary": 6.5, "residential": 5.5,
-                   "unclassified": 5.5, "living_street": 5.0, "service": 4.0,
-                   "track": 3.0}
-    WATER_W   = {"river": 8.0, "canal": 6.0, "stream": 2.5,
-                 "drain": 1.5, "ditch": 1.2}
     BARRIER_H = {"fence": 1.2, "wall": 1.8, "hedge": 1.5,
                  "guard_rail": 0.75, "retaining_wall": 2.0}
     BARRIER_MAT = {"hedge": "tree", "guard_rail": "asphalt"}  # others: building
@@ -1021,127 +1080,6 @@ def build_environment_meshes(surroundings: dict, mesh: dict,
         px2, pz2 = x0 + vx * hi, z0 + vz * hi
         d, _i = kd_road.query([px2, pz2])
         return (float(px2), float(pz2)) if d <= target + 0.6 else None
-
-    def _emit_flat(pts3, half_w, lift, verts, idx):
-        """Emit a draped strip from [(x, z, ext_y_or_None, u), ...].
-
-        Heights are computed PER EDGE VERTEX from ground_surf — the true
-        rendered-terrain height — plus a small lift, then lightly smoothed
-        along the run (clamped to never dip below the floor). The strip hugs
-        and banks with the terrain since each edge carries its own height.
-        Junction-extension rows (ext_y set) keep their tucked height so they
-        stay under the main road's edge.
-        """
-        n = len(pts3)
-        axs = np.array([p[0] for p in pts3])
-        azs = np.array([p[1] for p in pts3])
-        dxs_ = np.gradient(axs); dzs_ = np.gradient(azs)
-        L = np.sqrt(dxs_**2 + dzs_**2) + 1e-9
-        px_, pz_ = -dzs_ / L, dxs_ / L
-        hs = {}
-        for side in (+1, -1):
-            # ground_surf is the actual rendered terrain height, which is
-            # already smooth along the run — so the strip can hug the ground
-            # with only a small lift, instead of riding on max-vertex bounds
-            # (staircase) or a dilated envelope (floats above every hill).
-            floor = np.array([ground_surf(axs[k] + side*px_[k]*half_w,
-                                          azs[k] + side*pz_[k]*half_w) + lift
-                              for k in range(n)])
-            h = np.maximum(gaussian_filter1d(floor, sigma=1.2), floor) \
-                if n >= 3 else floor
-            for k, p in enumerate(pts3):
-                if p[2] is not None:          # junction extension: tuck
-                    h[k] = p[2]
-            hs[side] = h
-        v0 = len(verts)
-        for k, (x_, z_, _e, u_) in enumerate(pts3):
-            for side in (+1, -1):
-                verts.append(((x_ + side*px_[k]*half_w, float(hs[side][k]),
-                               z_ + side*pz_[k]*half_w),
-                              (0.0, 1.0, 0.0),
-                              (0.0 if side > 0 else 1.0, u_ * 0.1),
-                              (1.0, 0.0, 0.0)))
-        for k in range(n - 1):
-            a = v0 + k*2
-            idx.extend((a, a+3, a+1,  a, a+2, a+3))
-            idx.extend((a, a+1, a+3,  a, a+3, a+2))
-        return n - 1
-
-    # — Adjacent roads: blend seamlessly into the drivable road. Each run
-    #   truncated at a junction gets an extra endpoint pushed to just INSIDE
-    #   the road edge and tucked slightly below the road surface, so the side
-    #   road visually runs under the carriageway edge with no gap and no lip.
-    side_verts, side_idx = [], []
-    s_part = 0
-
-    def flush_side():
-        nonlocal side_verts, side_idx, s_part
-        if side_verts:
-            meshes.append((f"ENV_SIDEROAD_{s_part}", side_verts, side_idx,
-                           "asphalt"))
-            s_part += 1
-            side_verts, side_idx = [], []
-
-    def _draped_runs(pts_ll, clip_dist, ext_target, tuck):
-        """Runs as [(x, z, ext_y_or_None, u), ...]: heights are left to the
-        emitter except junction extensions, which carry their tucked height
-        (just under the main road's edge)."""
-        for rx_, rz_, rt_, prev_pt, next_pt in _clip_runs(pts_ll, clip_dist):
-            pts3 = []
-            if prev_pt is not None and ext_target is not None:
-                e = _extend_to_road(float(rx_[0]), float(rz_[0]),
-                                    prev_pt[0], prev_pt[1], ext_target)
-                if e:
-                    pts3.append((e[0], e[1],
-                                 ground_y_smooth(e[0], e[1]) - tuck,
-                                 float(rt_[0]) - 4.0))
-            for k in range(len(rx_)):
-                pts3.append((float(rx_[k]), float(rz_[k]), None,
-                             float(rt_[k])))
-            if next_pt is not None and ext_target is not None:
-                e = _extend_to_road(float(rx_[-1]), float(rz_[-1]),
-                                    next_pt[0], next_pt[1], ext_target)
-                if e:
-                    pts3.append((e[0], e[1],
-                                 ground_y_smooth(e[0], e[1]) - tuck,
-                                 float(rt_[-1]) + 4.0))
-            if len(pts3) >= 2:
-                yield pts3
-
-    n_side = 0
-    for rd in surroundings.get("roads", []):
-        w2 = SIDE_ROAD_W.get(rd.get("type"), 5.0) / 2.0
-        for pts3 in _draped_runs(rd["pts"], hw + 0.3,
-                                 ext_target=hw - 0.5, tuck=0.04):
-            if len(side_verts) + 2 * len(pts3) > 60000:
-                flush_side()
-            _emit_flat(pts3, w2, 0.10, side_verts, side_idx)
-            n_side += 1
-    flush_side()
-
-    # — Waterways: draped blue strips. Extended slightly under the road edge
-    #   so creeks crossing the route look like they pass through a culvert.
-    wat_verts, wat_idx = [], []
-    w_part = 0
-
-    def flush_water():
-        nonlocal wat_verts, wat_idx, w_part
-        if wat_verts:
-            meshes.append((f"ENV_WATERWAY_{w_part}", wat_verts, wat_idx,
-                           "water"))
-            w_part += 1
-            wat_verts, wat_idx = [], []
-
-    n_water = 0
-    for ww in surroundings.get("waterways", []):
-        w2 = WATER_W.get(ww.get("type"), 3.0) / 2.0
-        for pts3 in _draped_runs(ww["pts"], hw + 0.3,
-                                 ext_target=hw - 0.5, tuck=0.10):
-            if len(wat_verts) + 2 * len(pts3) > 60000:
-                flush_water()
-            _emit_flat(pts3, w2, 0.05, wat_verts, wat_idx)
-            n_water += 1
-    flush_water()
 
     # — Barriers: vertical ribbons (fences, walls, hedges, guard rails)
     #   following the terrain. Not extended into the road. The clip line sits
@@ -1214,16 +1152,17 @@ def build_environment_meshes(surroundings: dict, mesh: dict,
     for mat in list(barr):
         flush_barrier(mat)
 
-    if n_side or n_water or n_barr:
-        print(f"  [surroundings] draped {n_side} road, {n_water} waterway, "
-              f"{n_barr} barrier strip(s)")
+    if n_barr:
+        print(f"  [surroundings] {n_barr} barrier strip(s) "
+              f"(side roads/waterways are painted into the terrain)")
 
     # ── Trees: alpha-cutout cross-plane impostors ──
-    # Three quads at 60° with a painted RGBA tree silhouette (alpha-tested
-    # material) — the standard sim-racing technique. Reads as a real tree at
-    # driving distance and costs ~12 verts instead of ~40, which is what
-    # makes the higher scatter density affordable.
+    # Three quads at 60° sampling one column of a 4-variant silhouette atlas
+    # (repeating a single silhouette is what read as fake). Each tree also
+    # lays a soft alpha-blended shadow blob on the ground — real-time shadows
+    # fade with distance, and the baked blob is what keeps trees anchored.
     cans = {"tree": [[], [], 0], "tree2": [[], [], 0]}
+    shadow = [[], [], 0]
 
     def flush_tree_meshes():
         for mat in cans:
@@ -1232,22 +1171,28 @@ def build_environment_meshes(surroundings: dict, mesh: dict,
                 suffix = "" if mat == "tree" else "2"
                 meshes.append((f"ENV_TREE{suffix}_{cp}", cv, ci, mat))
                 cans[mat] = [[], [], cp + 1]
+        sv, si, sp = shadow
+        if sv:
+            meshes.append((f"ENV_SHADOW_{sp}", sv, si, "treeshadow"))
+            shadow[0], shadow[1], shadow[2] = [], [], sp + 1
 
     rng_t = np.random.default_rng(7)
     for x, z in tree_pts:
         gy = ground_surf(x, z)             # true rendered-terrain height
         gy_base = gy - 0.5                 # quad foot: sunk into the surface
-        if rng_t.random() < 0.45:          # conifer: tall and narrow
+        var = int(rng_t.integers(0, 4))    # atlas column
+        if rng_t.random() < 0.45:          # conifer
             h = rng_t.uniform(8.0, 14.0)
-            w = h * 0.46
+            w = h * TREE2_ASPECT[var]
             mat = "tree2"
-        else:                              # broadleaf: shorter and wide
-            h = rng_t.uniform(6.5, 11.0)
-            w = h * 0.88
+        else:                              # broadleaf (incl. gum variant)
+            h = rng_t.uniform(6.5, 11.5)
+            w = h * TREE_ASPECT[var]
             mat = "tree"
+        u0, u1 = var * 0.25, var * 0.25 + 0.25
         yaw = rng_t.uniform(0.0, math.pi)
         cv, ci, _ = cans[mat]
-        if len(cv) + 12 > 60000:
+        if len(cv) + 12 > 60000 or len(shadow[0]) + 5 > 60000:
             flush_tree_meshes()
             cv, ci, _ = cans[mat]
         top = gy + h
@@ -1260,12 +1205,29 @@ def build_environment_meshes(surroundings: dict, mesh: dict,
             v0 = len(cv)
             # DirectX v=0 is the TOP of the image (= tree top), so the base
             # vertices carry v=1 and the top vertices v=0.
-            cv.append(((x - dx_, gy_base, z - dz_), (0, 1, 0), (0, 1), (1, 0, 0)))
-            cv.append(((x + dx_, gy_base, z + dz_), (0, 1, 0), (1, 1), (1, 0, 0)))
-            cv.append(((x + dx_, top,     z + dz_), (0, 1, 0), (1, 0), (1, 0, 0)))
-            cv.append(((x - dx_, top,     z - dz_), (0, 1, 0), (0, 0), (1, 0, 0)))
+            cv.append(((x - dx_, gy_base, z - dz_), (0, 1, 0), (u0, 1), (1, 0, 0)))
+            cv.append(((x + dx_, gy_base, z + dz_), (0, 1, 0), (u1, 1), (1, 0, 0)))
+            cv.append(((x + dx_, top,     z + dz_), (0, 1, 0), (u1, 0), (1, 0, 0)))
+            cv.append(((x - dx_, top,     z - dz_), (0, 1, 0), (u0, 0), (1, 0, 0)))
             ci.extend((v0, v0+1, v0+2,  v0, v0+2, v0+3))
             ci.extend((v0, v0+2, v0+1,  v0, v0+3, v0+2))
+        # Shadow blob: centre + 4 corners, each conformed to the terrain so
+        # the blob hugs slopes instead of clipping into them.
+        sr = w * 0.42
+        s_yaw = rng_t.uniform(0.0, math.pi)
+        elong = rng_t.uniform(1.0, 1.3)
+        sv, si, _ = shadow
+        c0 = len(sv)
+        sv.append(((x, gy + 0.07, z), (0, 1, 0), (0.5, 0.5), (1, 0, 0)))
+        for k4, (ux, uz) in enumerate(((-1, -1), (1, -1), (1, 1), (-1, 1))):
+            ox = (ux * math.cos(s_yaw) - uz * math.sin(s_yaw)) * sr * elong
+            oz = (ux * math.sin(s_yaw) + uz * math.cos(s_yaw)) * sr
+            sx, sz = x + ox, z + oz
+            sv.append(((sx, ground_surf(sx, sz) + 0.07, sz), (0, 1, 0),
+                       ((ux + 1) / 2.0, (uz + 1) / 2.0), (1, 0, 0)))
+        for k4 in range(4):
+            a_, b_ = c0 + 1 + k4, c0 + 1 + (k4 + 1) % 4
+            si.extend((c0, a_, b_,  c0, b_, a_))   # double-sided fan
     flush_tree_meshes()
 
     return {"meshes": meshes, "n_trees": len(tree_pts),
@@ -2399,7 +2361,178 @@ def fetch_terrain_grid(mesh: dict) -> dict:
     }
 
 
-def build_terrain_meshes(mesh: dict, grid: dict) -> list:
+def _conform_terrain_to_side_paths(pts_xz, ys, surroundings, mesh, kd_cl, hw):
+    """
+    Grade the terrain along side roads and waterways, TWO ways:
+
+    1. Adjust existing grid nodes near each path toward a smooth along-path
+       profile (flat across, feathered back into raw terrain laterally and
+       at path ends).
+    2. INJECT ribbon cross-sections (centre, ±half-width at profile height,
+       ±blend-edge at raw terrain height) into the triangulation. The 12m
+       grid alone almost never has a node inside a 3–4m corridor, so without
+       these the "shelf" only partially existed between grid nodes and the
+       draped strips still floated over residual bumps.
+
+    Waterways are depressed slightly so water sits in a shallow channel.
+    Returns (adjusted_ys, extra_pts_xz, extra_ys).
+    """
+    from scipy.spatial import cKDTree
+    paths = []
+    for rd in surroundings.get("roads", []):
+        paths.append((rd["pts"], SIDE_ROAD_W.get(rd.get("type"), 5.0) / 2.0,
+                      0.0, "road"))
+    for ww in surroundings.get("waterways", []):
+        paths.append((ww["pts"], WATER_W.get(ww.get("type"), 3.0) / 2.0,
+                      0.35, "water"))
+    corridors = []          # (samples_xz, paint_half_w, kind) for painting
+    drop = np.zeros(len(ys), dtype=bool)   # grid nodes inside the paint zone
+    if not paths:
+        return ys, np.empty((0, 2)), np.empty(0), corridors, drop
+
+    proj_p = mesh["proj"]
+    proj = Transformer.from_crs(
+        "EPSG:4326",
+        f"+proj=tmerc +lat_0={proj_p['mid_lat']} +lon_0={proj_p['mid_lon']} +units=m",
+        always_xy=True)
+    ox, oz = proj_p["ox"], proj_p["oz"]
+
+    def to_local(lat, lon):
+        X, Z = proj.transform(lon, lat)
+        return X - ox, -Z - oz
+
+    node_kd = cKDTree(pts_xz)
+    BLEND = 7.0
+    adj_w = np.zeros(len(ys))
+    adj_t = np.zeros(len(ys))
+    extra_xz, extra_y = [], []
+    n_conf = 0
+    for pts_ll, p_hw, depress, kind in paths:
+        half_w = p_hw + 0.6           # graded flat zone: paint edge + margin
+        loc = [to_local(la, lo) for la, lo in pts_ll]
+        # resample every 6m along the polyline
+        rs = []
+        carry = 0.0
+        for k in range(len(loc) - 1):
+            x0, z0 = loc[k]; x1, z1 = loc[k + 1]
+            seg = math.hypot(x1 - x0, z1 - z0)
+            if seg < 1e-6:
+                continue
+            t = carry
+            while t < seg:
+                f = t / seg
+                rs.append((x0 + (x1 - x0) * f, z0 + (z1 - z0) * f))
+                t += 6.0
+            carry = t - seg
+        if len(rs) < 3:
+            continue
+        rs = np.array(rs)
+        corridors.append((rs, p_hw, kind))
+        # target profile: current terrain height along the path, smoothed —
+        # a graded version of the hill the path climbs
+        d4, i4 = node_kd.query(rs, k=4)
+        w4 = 1.0 / np.maximum(d4, 1e-6)
+        prof = (ys[i4] * w4).sum(axis=1) / w4.sum(axis=1)
+        prof = gaussian_filter1d(prof, 4.0) - depress
+        # keep clear of the main road: its own grading wins near junctions
+        d_cl, _ = kd_cl.query(rs)
+        keep = d_cl > hw + 6.0
+        if keep.sum() < 2:
+            continue
+        # longitudinal end taper: without it the shelf STOPS dead where the
+        # path ends (or where samples were dropped at the main road), leaving
+        # a step back onto raw terrain — feather over ~4 samples (24m),
+        # applied per contiguous kept run
+        end_w = np.zeros(len(rs))
+        k0 = None
+        for k in range(len(rs) + 1):
+            if k < len(rs) and keep[k]:
+                if k0 is None:
+                    k0 = k
+            elif k0 is not None:
+                for k2 in range(k0, k):
+                    end_w[k2] = min(1.0, (k2 - k0 + 1) / 4.0,
+                                    (k - k2) / 4.0)
+                k0 = None
+        s_kd = cKDTree(rs[keep])
+        pk = prof[keep]
+        ek = end_w[keep]
+        # k=2 + inverse-distance blend ≈ linear interpolation along the path.
+        # Nearest-sample-only gave nodes a piecewise-CONSTANT profile that
+        # fought the linear ribbon between cross-sections (visible wobble).
+        dn2, sn2 = s_kd.query(pts_xz, k=2,
+                              distance_upper_bound=half_w + BLEND)
+        dn = dn2[:, 0]
+        m = np.isfinite(dn)
+        if not m.any():
+            continue
+        w = np.clip((half_w + BLEND - dn[m]) / BLEND, 0.0, 1.0)
+        w = w * w * (3.0 - 2.0 * w)                # smoothstep
+        s0 = np.clip(sn2[m, 0], 0, len(pk) - 1)
+        s1 = np.clip(sn2[m, 1], 0, len(pk) - 1)
+        d0 = np.maximum(dn2[m, 0], 1e-6)
+        d1 = dn2[m, 1]
+        both = np.isfinite(d1)
+        tgt = pk[s0].copy()
+        ew_n = ek[s0].copy()
+        if both.any():
+            w0 = 1.0 / d0[both]
+            w1 = 1.0 / np.maximum(d1[both], 1e-6)
+            tgt[both] = (pk[s0[both]] * w0 + pk[s1[both]] * w1) / (w0 + w1)
+            ew_n[both] = (ek[s0[both]] * w0 + ek[s1[both]] * w1) / (w0 + w1)
+        w = w * ew_n
+        idxs = np.nonzero(m)[0]
+        # Grid nodes inside the painted corridor are REMOVED from the
+        # triangulation: the bed surface comes only from ribbon points, so a
+        # node that disagrees with the bed (path crossings, taper ends) can
+        # no longer poke a triangle up through the road surface.
+        drop[idxs[dn[m] <= p_hw + 0.4]] = True
+        stronger = w > adj_w[idxs]
+        adj_w[idxs[stronger]] = w[stronger]
+        adj_t[idxs[stronger]] = tgt[stronger]
+        # ribbon cross-sections: a real graded road bed in the mesh
+        kept_i = np.nonzero(keep)[0]
+        for kk in range(0, len(kept_i), 1):
+            si = kept_i[kk]
+            ew_ = end_w[si]
+            if ew_ <= 0.01:
+                continue
+            i0 = kept_i[max(kk - 1, 0)]
+            i1 = kept_i[min(kk + 1, len(kept_i) - 1)]
+            tx_ = rs[i1][0] - rs[i0][0]
+            tz_ = rs[i1][1] - rs[i0][1]
+            tl = math.hypot(tx_, tz_) or 1.0
+            qx, qz = -tz_ / tl, tx_ / tl            # lateral unit vector
+            p_y = prof[si]
+            for off in (0.0, p_hw, -p_hw, half_w, -half_w,
+                        half_w + BLEND, -(half_w + BLEND)):
+                ex_ = rs[si][0] + qx * off
+                ez_ = rs[si][1] + qz * off
+                # raw terrain height at this exact spot
+                d4e, i4e = node_kd.query([ex_, ez_], k=4)
+                w4e = 1.0 / np.maximum(d4e, 1e-6)
+                raw_y = float((ys[i4e] * w4e).sum() / w4e.sum())
+                if abs(off) > half_w + 1e-6:        # blend edge: meets terrain
+                    extra_y.append(raw_y)
+                else:                               # road bed: graded profile,
+                    extra_y.append(p_y * ew_        # tapered at path ends
+                                   + raw_y * (1.0 - ew_))
+                extra_xz.append((ex_, ez_))
+        n_conf += 1
+    # never fight the main road corridor's own grading
+    d_main, _ = kd_cl.query(pts_xz)
+    adj_w[d_main < hw + 6.0] = 0.0
+    if n_conf:
+        print(f"  [terrain] graded road beds along {n_conf} side roads / "
+              f"waterways ({len(extra_xz)} ribbon points)")
+    return (ys * (1.0 - adj_w) + adj_t * adj_w,
+            np.array(extra_xz) if extra_xz else np.empty((0, 2)),
+            np.array(extra_y) if extra_y else np.empty(0),
+            corridors, drop)
+
+
+def build_terrain_meshes(mesh: dict, grid: dict,
+                         surroundings: dict = None) -> list:
     """
     Triangulate the conformed grid + a grass-edge collar into physical terrain
     (1GRASS_* → AC GRASS surface, so leaving the road lands on real ground).
@@ -2450,9 +2583,48 @@ def build_terrain_meshes(mesh: dict, grid: dict) -> list:
     # the road's grass strip watertight and no gap can open where the grid
     # lattice misses the road.
     n_ref = len(rx)
-    # Collar sits at the corridor edge — which is the road edge when
-    # grass_width is 0, so terrain meets the road flush. Never inside the road.
-    floor = hw
+    # Collar tucks 0.3m UNDER the road edge, 5cm below its surface. The road
+    # edge polyline (per-point normals + fold fixing) and this collar ring
+    # (6m refs + curvature capping) are different curves — they only coincide
+    # on straights, and on corners the divergence opened sliver gaps between
+    # road and terrain. Overlapping in plan with the collar just below the
+    # road surface makes a gap geometrically impossible; the overlap strip is
+    # hidden under the carriageway.
+    # DOUBLE collar ring. The outer ring sits AT the road edge just below
+    # the surface — terrain's climb into the hillside starts there, never
+    # inside the carriageway (a single tucked ring let uphill terrain ramp
+    # up from inside the road and cover the edge lines). The inner ring sits
+    # 0.5m INSIDE the road edge, deeper below the surface: the strip between
+    # the rings underlaps the carriageway, so any plan divergence between
+    # this ring and the true fold-fixed road edge (up to ~0.46m on an R=10m
+    # hairpin with 6m refs) is covered from below — no sliver gap can open.
+    OVERLAP = 0.50
+    RINGS = ((OVERLAP, 0.10),   # (inset from road edge, depth below surface)
+             (0.0,     0.04))   # 2cm shimmered against the road at distance
+    floor = max(0.5, hw - OVERLAP)
+
+    def _cl_height_at(px, pz, ci):
+        """Road height at the point's projection onto the centreline —
+        nearest-POINT height mismatches the local surface by up to
+        grade × half the centreline spacing on steep roads, enough to poke
+        the tucked collar up through the carriageway."""
+        best = float(cl_y[ci]); bd = None
+        for j0 in (ci - 1, ci):
+            j1 = j0 + 1
+            if j0 < 0 or j1 >= len(cl_xz):
+                continue
+            ax0, az0 = cl_xz[j0]; bx0, bz0 = cl_xz[j1]
+            ex, ez = bx0 - ax0, bz0 - az0
+            L2 = ex * ex + ez * ez
+            if L2 < 1e-9:
+                continue
+            t = min(1.0, max(0.0, ((px - ax0) * ex + (pz - az0) * ez) / L2))
+            qx, qz = ax0 + ex * t, az0 + ez * t
+            d = (px - qx) ** 2 + (pz - qz) ** 2
+            if bd is None or d < bd:
+                bd = d
+                best = float(cl_y[j0]) * (1 - t) + float(cl_y[j1]) * t
+        return best
     for i in range(n_ref):
         i0 = max(i - 1, 0); i1 = min(i + 1, n_ref - 1)
         dx = rx[i1] - rx[i0]; dz = rz[i1] - rz[i0]
@@ -2470,29 +2642,29 @@ def build_terrain_meshes(mesh: dict, grid: dict) -> list:
             Oz = (a2*(cxr - bx) + b2*(ax - cxr) + c2*(bx - ax)) / det
             Rc = math.hypot(bx - Ox, bz - Oz)
         for side in (+1, -1):
-            d_off = indent
-            if Ox is not None and Rc < 1e4:
-                if side * (px_ * (Ox - bx) + pz_ * (Oz - bz)) > 0:   # inside
-                    d_off = min(indent, 0.8 * Rc)
-            d_off = max(floor, d_off)
-            cxp = rx[i] + side * px_ * d_off
-            czp = rz[i] + side * pz_ * d_off
-            # A ref-perpendicular offset can still land inside the road on a
-            # bend (nearest true-centreline point differs from the ref); push
-            # it back out to the road edge so terrain never covers the road.
-            dcl, ci = kd_cl.query([cxp, czp])
-            if dcl < hw:
-                ox0, oz0 = cl_xz[ci]
-                vx, vz = cxp - ox0, czp - oz0
-                vl = math.hypot(vx, vz) or 1.0
-                cxp = ox0 + vx / vl * hw
-                czp = oz0 + vz / vl * hw
-            pts.append((cxp, czp))
-            # Height from the NEAREST centreline point, not this collar
-            # point's own ref: on a hairpin the clamp above can move the
-            # point next to a different stretch of road, and keeping the
-            # ref height would leave a vertical lip at the road edge.
-            ys.append(float(cl_y[ci]) - g_drop)
+            for inset, tuck in RINGS:
+                d_off = indent - inset
+                if Ox is not None and Rc < 1e4:
+                    if side * (px_ * (Ox - bx) + pz_ * (Oz - bz)) > 0:  # inside
+                        d_off = min(d_off, 0.8 * Rc)
+                d_off = max(floor, d_off)
+                cxp = rx[i] + side * px_ * d_off
+                czp = rz[i] + side * pz_ * d_off
+                # A ref-perpendicular offset can still land inside the road
+                # on a bend (nearest true-centreline point differs from the
+                # ref); push it back out so it never crosses the centre.
+                dcl, ci = kd_cl.query([cxp, czp])
+                if dcl < floor:
+                    ox0, oz0 = cl_xz[ci]
+                    vx, vz = cxp - ox0, czp - oz0
+                    vl = math.hypot(vx, vz) or 1.0
+                    cxp = ox0 + vx / vl * floor
+                    czp = oz0 + vz / vl * floor
+                pts.append((cxp, czp))
+                # Height from the projection onto the centreline: nearest-
+                # POINT heights mismatch the local surface on steep grades,
+                # enough to poke a tucked ring up through the carriageway.
+                ys.append(_cl_height_at(cxp, czp, int(ci)) - g_drop - tuck)
 
     if len(pts) < 3:
         return []
@@ -2520,6 +2692,24 @@ def build_terrain_meshes(mesh: dict, grid: dict) -> list:
                     levelled[a] = float(np.median(ys[widx][nb]))
             ys[widx] = levelled
             print(f"  [terrain] levelled {len(widx)} water points")
+
+    # ── Side-road / waterway shelves ──
+    # Grade the terrain itself along side paths, so the draped strips lie ON
+    # the ground instead of hovering over its bumps.
+    corridors = []
+    if surroundings:
+        try:
+            ys, ex_xz, ex_y, corridors, drop_n = \
+                _conform_terrain_to_side_paths(
+                    pts, ys, surroundings, mesh, kd_cl, hw)
+            if drop_n.any():                 # nodes inside painted corridors
+                pts = pts[~drop_n]
+                ys = ys[~drop_n]
+            if len(ex_xz):
+                pts = np.vstack([pts, ex_xz])
+                ys = np.concatenate([ys, ex_y])
+        except Exception as e:
+            print(f"  [terrain] side-path grading skipped: {e}")
     pos = np.column_stack([pts[:, 0], ys, pts[:, 1]])   # (N,3) world xyz
 
     tri = Delaunay(pts)
@@ -2539,7 +2729,9 @@ def build_terrain_meshes(mesh: dict, grid: dict) -> list:
         cx, cz = p.mean(axis=0)
         dc, _ = kd_cl.query([cx, cz])
         dv, _ = kd_cl.query(p)             # distance of each vertex to road
-        if dc < hw or float(dv.min()) < hw - 0.05:   # over the road → drop
+        # thresholds sit just inside the tucked collar (hw−0.50): the hidden
+        # overlap strip is kept, anything genuinely over the road is dropped
+        if dc < hw - 0.55 or float(dv.min()) < hw - 0.60:
             continue
         keep.append(s)
     if not keep:
@@ -2564,6 +2756,53 @@ def build_terrain_meshes(mesh: dict, grid: dict) -> list:
     out = []
     groups = {}          # material -> [verts, idx, vmap, part]
 
+    # Corridor lookup for painting side roads / waterways ONTO the terrain.
+    # The terrain already carries their graded bed; texturing those triangles
+    # directly (instead of hovering a separate strip above them) makes the
+    # side road flush and hill-integrated BY CONSTRUCTION — there is no
+    # second surface to misalign. Painted road triangles get ROAD physics.
+    cor_kd = None
+    if corridors:
+        cp, ct, cv, chw, ck = [], [], [], [], []
+        v_run = 0.0
+        for rs_, phw_, kind_ in corridors:
+            tanx = np.gradient(rs_[:, 0]); tanz = np.gradient(rs_[:, 1])
+            tl = np.sqrt(tanx ** 2 + tanz ** 2) + 1e-9
+            cp.append(rs_)
+            ct.append(np.column_stack([tanx / tl, tanz / tl]))
+            cv.append(v_run + np.arange(len(rs_)) * 6.0)   # arc length (6m)
+            v_run += len(rs_) * 6.0 + 64.0                 # gap between paths
+            chw.append(np.full(len(rs_), phw_))
+            ck.append(np.full(len(rs_), 0 if kind_ == "road" else 1))
+        cor_pts = np.vstack(cp)
+        cor_tan = np.vstack(ct)
+        cor_arc = np.concatenate(cv)
+        cor_hw = np.concatenate(chw)
+        cor_kind = np.concatenate(ck)
+        cor_kd = cKDTree(cor_pts)
+
+    def corridor_mat(cx, cz):
+        if cor_kd is None:
+            return None
+        dd, ii = cor_kd.query([cx, cz], k=3)
+        for d_, i_ in zip(np.atleast_1d(dd), np.atleast_1d(ii)):
+            if i_ < len(cor_hw) and d_ <= cor_hw[i_]:
+                return "sideroad" if cor_kind[i_] == 0 else "water"
+        return None
+
+    def corridor_uv(x, z):
+        """Path-aligned UV: U spans the corridor width (wheel tracks follow
+        the road), V runs along it at one texture repeat per 8m."""
+        _, i_ = cor_kd.query([x, z])
+        tx_, tz_ = cor_tan[i_]
+        dxp = x - cor_pts[i_][0]
+        dzp = z - cor_pts[i_][1]
+        lat = -tz_ * dxp + tx_ * dzp
+        along = tx_ * dxp + tz_ * dzp
+        u = 0.5 + lat / (2.0 * cor_hw[i_] + 0.8)
+        v = (cor_arc[i_] + along) / 8.0
+        return (float(u), float(v))
+
     def group(matkey):
         if matkey not in groups:
             groups[matkey] = [[], [], {}, 0]
@@ -2572,13 +2811,16 @@ def build_terrain_meshes(mesh: dict, grid: dict) -> list:
     def flush(matkey):
         verts, idx, vmap, part = groups[matkey]
         if verts:
-            suffix = "" if matkey == "terrain" else f"_{matkey.upper()}"
-            n = part
-            name = f"1GRASS_TER{suffix}" if n == 0 else f"1GRASS_TER{suffix}_{n}"
+            if matkey == "sideroad":
+                name = f"1ROAD_SIDE_{part}"      # drivable: ROAD physics
+            else:
+                suffix = "" if matkey == "terrain" else f"_{matkey.upper()}"
+                name = f"1GRASS_TER{suffix}" if part == 0 \
+                       else f"1GRASS_TER{suffix}_{part}"
             out.append((name, verts, idx, matkey))
             groups[matkey] = [[], [], {}, part + 1]
 
-    def vid(g, k):
+    def vid(g, k, uv=None):
         verts, idx, vmap, _ = g
         vi = vmap.get(k)
         if vi is None:
@@ -2587,7 +2829,8 @@ def build_terrain_meshes(mesh: dict, grid: dict) -> list:
             vi = len(verts)
             verts.append(((float(x), float(y), float(z)),
                           (float(nx_), float(ny_), float(nz_)),
-                          (float(x) / 20.0, float(z) / 20.0),
+                          uv if uv is not None
+                          else (float(x) / 20.0, float(z) / 20.0),
                           (1.0, 0.0, 0.0)))
             vmap[k] = vi
         return vi
@@ -2595,21 +2838,30 @@ def build_terrain_meshes(mesh: dict, grid: dict) -> list:
     for s in keep:
         p0, p1, p2 = pos[s]
         matkey = "terrain"
+        cx, cz = float((p0[0] + p1[0] + p2[0]) / 3.0), \
+                 float((p0[2] + p1[2] + p2[2]) / 3.0)
         if lc is not None and inv_ll is not None:
-            cx, cz = float((p0[0] + p1[0] + p2[0]) / 3.0), \
-                     float((p0[2] + p1[2] + p2[2]) / 3.0)
             la, lo = inv_ll(cx, cz)
             matkey = LC_MATERIAL.get(lc(la, lo), "terrain")
+        cm = corridor_mat(cx, cz)
+        if cm is not None:
+            matkey = cm
         g = group(matkey)
         if len(g[0]) + 3 > 60000:
             flush(matkey)
             g = group(matkey)
         gy = np.cross(p1 - p0, p2 - p0)[1]     # up-facing winding
         a, b, c = int(s[0]), int(s[1]), int(s[2])
-        if gy >= 0:
-            g[1].extend((vid(g, a), vid(g, b), vid(g, c)))
+        if matkey == "sideroad":               # path-aligned road UVs
+            va = vid(g, a, corridor_uv(float(pos[a][0]), float(pos[a][2])))
+            vb = vid(g, b, corridor_uv(float(pos[b][0]), float(pos[b][2])))
+            vc = vid(g, c, corridor_uv(float(pos[c][0]), float(pos[c][2])))
         else:
-            g[1].extend((vid(g, a), vid(g, c), vid(g, b)))
+            va, vb, vc = vid(g, a), vid(g, b), vid(g, c)
+        if gy >= 0:
+            g[1].extend((va, vb, vc))
+        else:
+            g[1].extend((va, vc, vb))
     for matkey in list(groups):
         flush(matkey)
 
@@ -2661,6 +2913,7 @@ def build_far_terrain(mesh: dict, grid: dict) -> list:
     keep = (d_ref > TERRAIN_MAX_DIST - step) & (d_ref <= FAR_MAX_DIST)
     nodes = flat[keep]
     near = near_flat[keep].astype(int)
+    d_kept = d_ref[keep]
     if len(nodes) < 3:
         return []
 
@@ -2709,6 +2962,50 @@ def build_far_terrain(mesh: dict, grid: dict) -> list:
         # double-sided: no underlay copy is made for ENV_ meshes
         idx.extend((va, vb, vc,  va, vc, vb))
     flush()
+
+    # ── Distant filler trees ──
+    # Where WorldCover says forest, drop cheap two-plane billboard trees on
+    # the backdrop so far hillsides read as wooded rather than felt-covered —
+    # the standard trick for distant landscape in AC track making. Only
+    # beyond the inner terrain, where the near scatter can't reach.
+    if lc is not None:
+        rng_f = np.random.default_rng(17)
+        fv, fi = [], []
+        f_part = n_far = 0
+        for k in range(len(nodes)):
+            if n_far >= 6000 or d_kept[k] < TERRAIN_MAX_DIST + 15.0:
+                continue
+            dns = LC_TREE_DENSITY.get(lc(latlon[k][0], latlon[k][1]), 0.0)
+            if dns <= 0 or rng_f.random() > dns * 0.6:
+                continue
+            for _ in range(int(rng_f.integers(1, 3))):
+                tx = float(nodes[k][0]) + rng_f.uniform(-step/2, step/2)
+                tz = float(nodes[k][1]) + rng_f.uniform(-step/2, step/2)
+                ty = float(ys[k]) - 1.5          # generous sink: cell is coarse
+                h = rng_f.uniform(10.0, 16.0)
+                var = int(rng_f.integers(0, 4))
+                w = h * TREE_ASPECT[var]
+                u0, u1 = var * 0.25, var * 0.25 + 0.25
+                yaw = rng_f.uniform(0.0, math.pi)
+                if len(fv) + 8 > 60000:
+                    out.append((f"ENV_FARTREE_{f_part}", fv, fi, "tree"))
+                    fv, fi, f_part = [], [], f_part + 1
+                for pi_ in range(2):             # two crossed planes
+                    a_ = yaw + pi_ * math.pi / 2.0
+                    ddx = math.cos(a_) * w * 0.5
+                    ddz = math.sin(a_) * w * 0.5
+                    v0 = len(fv)
+                    fv.append(((tx-ddx, ty,   tz-ddz), (0,1,0), (u0,1), (1,0,0)))
+                    fv.append(((tx+ddx, ty,   tz+ddz), (0,1,0), (u1,1), (1,0,0)))
+                    fv.append(((tx+ddx, ty+h, tz+ddz), (0,1,0), (u1,0), (1,0,0)))
+                    fv.append(((tx-ddx, ty+h, tz-ddz), (0,1,0), (u0,0), (1,0,0)))
+                    fi.extend((v0, v0+1, v0+2,  v0, v0+2, v0+3))
+                    fi.extend((v0, v0+2, v0+1,  v0, v0+3, v0+2))
+                n_far += 1
+        if fv:
+            out.append((f"ENV_FARTREE_{f_part}", fv, fi, "tree"))
+        if n_far:
+            print(f"  [terrain] {n_far} distant filler trees on far forest")
     return out
 
 def process_road(coords: list, road_width: float = 8.0,
@@ -2843,9 +3140,12 @@ def process_road(coords: list, road_width: float = 8.0,
 
     # Build road mesh
     vertices, uvs, faces = [], [], []
-    ts = 0.1  # texture scale
+    ts = 0.1        # texture scale for grass/skirt strips
+    ts_road = 0.0125 # road: one repeat per 80m — the tall road texture packs
+                    # non-repeating wear into each repeat, so the pattern
+                    # doesn't telegraph every 10m like the old square tile
     for i in range(n_pts):
-        uc = i / (n_pts-1) * total_length * ts
+        uc = i / (n_pts-1) * total_length * ts_road
         vertices.append((lx[i], float(ys[i]), lz[i]))
         vertices.append((rx[i], float(ys[i]), rz[i]))
         uvs.append((0.0, uc)); uvs.append((1.0, uc))
@@ -3231,63 +3531,130 @@ def _classify_road_style(road_type, surface) -> str:
 
 def build_road_texture(size: int = 256, style: str = "sealed") -> bytes:
     """Drivable-road surface in Australian marking conventions, chosen by the
-    selected road's OSM highway/surface tags. U axis = across road, V = along.
+    selected road's OSM highway/surface tags. 256 wide × 1024 tall = one
+    repeat per 40m of road, so wear features (tar snakes, repair patches) are
+    segmented and scattered instead of telegraphing every tile.
+    U = across road, V = along.
       sealed  — primary/secondary: white edge lines + dashed white centre
                 line (AU centre lines are white, not yellow)
-      highway — motorway/trunk: fresher darker asphalt, denser centre dashes
-      rural   — minor sealed roads: aged patchy bitumen, faded edge lines,
-                NO centre line (typical narrow country roads)
+      highway — motorway/trunk: fresher darker asphalt, cleanest surface
+      rural   — minor sealed roads: aged patchy bitumen, faded broken edge
+                lines, NO centre line, heavier wear
       gravel  — unsealed/track: red-brown laterite with compacted wheel
                 tracks and stone speckle, no markings
     """
+    W, H = size, size * 8
     rng = np.random.default_rng(42)
-    lum = _fbm(size, rng)
-    xs = np.arange(size)
+    lum = _fbm(H, rng)[:, :W]          # periodic vertically → seamless tiling
+    xs = np.arange(W)
 
     if style == "gravel":
-        img = np.empty((size, size, 3), dtype=np.float64)
+        img = np.empty((H, W, 3), dtype=np.float64)
         img[:, :, 0] = 148 + lum * 26
         img[:, :, 1] = 106 + lum * 22
         img[:, :, 2] = 76 + lum * 18
         for cx_f in (0.30, 0.70):          # compacted wheel tracks: lighter
-            wtd = np.exp(-((xs / size - cx_f) / 0.055) ** 2)
+            wtd = np.exp(-((xs / W - cx_f) / 0.055) ** 2)
             img += wtd[None, :, None] * np.array([16.0, 14.0, 12.0])
-        dark = rng.random((size, size)) < 0.02      # stone speckle
-        lite = rng.random((size, size)) < 0.015
+        dark = rng.random((H, W)) < 0.02       # stone speckle
+        lite = rng.random((H, W)) < 0.015
         img[dark] -= 34
         img[lite] += 30
-        return _png_encode(size, size,
+        return _png_encode(W, H,
                            np.clip(img, 0, 255).astype(np.uint8).tobytes())
 
     base = {"sealed": (57, 57, 60), "highway": (48, 48, 53),
             "rural": (74, 73, 74)}.get(style, (57, 57, 60))
-    img = np.empty((size, size, 3), dtype=np.float64)
+    img = np.empty((H, W, 3), dtype=np.float64)
     amp = 26 if style == "rural" else 12            # old bitumen is patchier
     for ch in range(3):
         img[:, :, ch] = base[ch] + lum * amp
-    if style == "rural":                            # darker patch repairs
-        patch = _fbm(size, rng, octaves=((3, 1.0), (6, 0.5)))
+    if style == "rural":                            # darker resurfaced areas
+        patch = _fbm(H, rng, octaves=((3, 1.0), (6, 0.5)))[:, :W]
         img -= np.clip((patch - 0.25) * 3.0, 0, 1)[:, :, None] * 18.0
-    for cx_f in (0.30, 0.70):                       # tyre-polished strips
-        wtd = np.exp(-((xs / size - cx_f) / 0.07) ** 2)
-        img -= wtd[None, :, None] * 6.0
+
+    grime = _fbm(H, rng, octaves=((5, 1.0), (20, 0.5)))[:, :W]
+    for cx_f in (0.30, 0.70):                       # tyre-polished strips,
+        wtd = np.exp(-((xs / W - cx_f) / 0.07) ** 2)      # patchy not uniform
+        img -= (wtd[None, :] * (6.0 + np.clip(grime, 0, 1) * 8.0))[:, :, None]
+
+    # Tar snakes: SEGMENTED crack-seal lines that fade in and out, scattered
+    # over the 40m repeat — full-length squiggles repeated every tile is
+    # exactly what read as a pattern.
+    n_snakes = {"rural": 13, "sealed": 5}.get(style, 0)
+    for _ in range(n_snakes):
+        ln = int(rng.uniform(H * 0.12, H * 0.3))
+        r0 = int(rng.uniform(0, H - ln))
+        col = float(rng.uniform(W * 0.15, W * 0.85))
+        for rr in range(ln):
+            col = min(max(col + rng.uniform(-1.4, 1.4), 2), W - 4)
+            fade = min(1.0, rr / 24.0, (ln - rr) / 24.0)   # soft ends
+            img[r0 + rr, int(col):int(col) + 2, :] -= 18.0 * fade
+
+    # Repair patches: straight-edged rectangles of slightly different
+    # asphalt — one per vertical band so they never stack on each other
+    n_patch = {"rural": 5, "sealed": 2}.get(style, 0)
+    for pi_ in range(n_patch):
+        band = H // max(n_patch, 1)
+        ph = int(rng.uniform(40, min(110, band - 10)))
+        pw = int(rng.uniform(W * 0.25, W * 0.6))
+        r0 = pi_ * band + int(rng.uniform(0, band - ph))
+        c0 = int(rng.uniform(W * 0.12, W * 0.85 - pw))
+        img[r0:r0+ph, c0:c0+pw, :] -= 7.0
+        img[r0:r0+2, c0:c0+pw, :] -= 12.0             # seam edges
+        img[r0+ph-2:r0+ph, c0:c0+pw, :] -= 12.0
+        img[r0:r0+ph, c0:c0+2, :] -= 12.0
+        img[r0:r0+ph, c0+pw-2:c0+pw, :] -= 12.0
     img = np.clip(img, 0, 255).astype(np.uint8)
 
-    # Edge lines (faded on rural)
-    e0 = max(2, size // 26)
-    ew = max(2, size // 64)
+    # Edge lines (faded on rural, with broken/worn-away segments)
+    e0 = max(2, W // 26)
+    ew = max(2, W // 64)
     edge_c = 170 if style == "rural" else 225
-    img[:, e0:e0 + ew, :] = edge_c
-    img[:, size - e0 - ew:size - e0, :] = edge_c
+    keep = slice(None)
+    if style == "rural":
+        seg = np.repeat(rng.random(32) > 0.22, H // 32)   # missing chunks
+        keep = np.resize(seg, H)
+    img[keep, e0:e0 + ew, :] = edge_c
+    img[keep, W - e0 - ew:W - e0, :] = edge_c
 
-    # Dashed white centre line — none on rural back roads
+    # Dashed white centre line: 10m cycle (~3m mark / 7m gap), 4 cycles per
+    # repeat — none on rural back roads
     if style != "rural":
-        c = size // 2
-        cw = max(1, size // 128)
-        dash = int(size * (0.6 if style == "highway" else 0.5))
-        img[0:dash, c - cw - 1:c + cw + 1, :] = 210
+        c = W // 2
+        cw = max(1, W // 128)
+        cyc = H // 8
+        mark = int(cyc * 0.3)
+        for k in range(8):
+            img[k * cyc:k * cyc + mark, c - cw - 1:c + cw + 1, :] = 210
 
-    return _png_encode(size, size, img.tobytes())
+    return _png_encode(W, H, img.tobytes())
+
+
+
+def build_sideroad_texture(size: int = 256) -> bytes:
+    """Side-road surface: worn unmarked bitumen with lighter wheel tracks
+    running along V and gravelly fading edges at the U extremes. Painted
+    terrain triangles carry path-aligned UVs (U across the corridor,
+    V along it), so the tracks follow the road. No painted markings —
+    these are lanes and minor roads where wrong markings would jar.
+    Tileable along V."""
+    rng = np.random.default_rng(83)
+    lum = _fbm(size, rng)
+    xs = np.arange(size)
+    img = np.empty((size, size, 3), dtype=np.float64)
+    img[:, :, 0] = 62 + lum * 18
+    img[:, :, 1] = 62 + lum * 18
+    img[:, :, 2] = 65 + lum * 18
+    for cx_f in (0.32, 0.68):                    # wheel tracks: worn lighter
+        wtd = np.exp(-((xs / size - cx_f) / 0.08) ** 2)
+        img += wtd[None, :, None] * 9.0
+    edge = np.clip((np.abs(xs / size - 0.5) - 0.40) / 0.10, 0, 1)
+    img += (edge[None, :, None]
+            * (np.array([44.0, 32.0, 10.0])[None, None, :]
+               * (0.6 + 0.4 * np.clip(lum, -1, 1))[:, :, None]))
+    return _png_encode(size, size,
+                       np.clip(img, 0, 255).astype(np.uint8).tobytes())
 
 
 def build_grass_texture(size: int = 256) -> bytes:
@@ -3373,46 +3740,6 @@ def build_commercial_texture(size: int = 128) -> bytes:
     return _png_encode(size, size, img.tobytes())
 
 
-def build_tree2_texture(size: int = 256) -> bytes:
-    """Conifer impostor: RGBA silhouette of stacked drooping tiers over a
-    short trunk, dark olive, ragged alpha edge. Image top = tree top."""
-    from scipy.ndimage import binary_erosion
-    rng = np.random.default_rng(41)
-    yy, xx = np.mgrid[0:size, 0:size].astype(float)
-    cx = size / 2.0
-
-    canopy = np.zeros((size, size), dtype=bool)
-    top, bot = 0.03, 0.88                       # canopy vertical extent
-    tiers = 7
-    for row in range(int(size * top), int(size * bot)):
-        t = (row / size - top) / (bot - top)    # 0 at tip → 1 at base
-        tier_ph = (t * tiers) % 1.0             # sawtooth per tier
-        w = size * 0.40 * (0.12 + 0.88 * t) * (1.0 - 0.32 * tier_ph)
-        w *= rng.uniform(0.92, 1.08)
-        canopy[row, int(cx - w):int(cx + w)] = True
-
-    trunk = np.zeros((size, size), dtype=bool)
-    hwd = int(size * 0.022)
-    trunk[int(size * 0.80):, int(cx - hwd):int(cx + hwd)] = True
-
-    alpha = canopy | trunk
-    edge = alpha & ~binary_erosion(alpha, iterations=2)
-    alpha &= ~(edge & (rng.random((size, size)) < 0.5))
-
-    lum = _fbm(size, rng)
-    img = np.empty((size, size, 4), dtype=np.float64)
-    depth = np.clip((yy / size - 0.1) * 1.2, 0, 1)
-    img[:, :, 0] = 48 + lum * 22 - depth * 12
-    img[:, :, 1] = 72 + lum * 26 - depth * 18
-    img[:, :, 2] = 44 + lum * 16 - depth * 10
-    tv = trunk & ~canopy
-    img[tv, 0] = 82; img[tv, 1] = 62; img[tv, 2] = 46
-    img[:, :, 3] = np.where(alpha, 255, 0)
-    return _png_encode(size, size,
-                       np.clip(img, 0, 255).astype(np.uint8).tobytes(),
-                       rgba=True)
-
-
 def build_asphalt_texture(size: int = 128) -> bytes:
     """Plain unmarked asphalt for adjacent roads (no centre/edge lines)."""
     rng = np.random.default_rng(97)
@@ -3432,63 +3759,145 @@ def build_roof_texture(size: int = 64) -> bytes:
     return _png_encode(size, size, img.tobytes())
 
 
-def build_tree_texture(size: int = 256) -> bytes:
-    """Broadleaf tree impostor: full RGBA silhouette (trunk + branches +
-    clumped canopy) with a ragged alpha edge, for alpha-tested cross-plane
-    quads. Image top = tree top (DirectX v=0 at the top of the image).
-    RGB is filled with canopy green everywhere so bilinear sampling never
-    pulls dark halo pixels in from transparent texels."""
+TREE_ASPECT  = (0.88, 0.70, 0.55, 1.02)   # broadleaf variant width/height
+TREE2_ASPECT = (0.46, 0.32, 0.58, 0.28)   # conifer variant width/height
+
+
+def _paint_broadleaf(size, rng, canopy_cy, canopy_rx, canopy_ry, clumps,
+                     clump_r, foliage, trunk_rgb, trunk_w, sparse=0.45):
+    """One broadleaf silhouette tile (RGBA float array). Image top = tree top."""
     from scipy.ndimage import binary_erosion
-    rng = np.random.default_rng(23)
     yy, xx = np.mgrid[0:size, 0:size].astype(float)
     cx = size / 2.0
-
-    # Canopy: union of many discs biased into an ellipse in the upper part
     canopy = np.zeros((size, size), dtype=bool)
-    for _ in range(70):
+    for _ in range(clumps):
         ang = rng.uniform(0, 2 * math.pi)
         rad = rng.uniform(0, 1) ** 0.55
-        ex = cx + math.cos(ang) * rad * size * 0.36
-        ey = size * 0.34 + math.sin(ang) * rad * size * 0.26
-        r = rng.uniform(0.05, 0.13) * size
+        ex = cx + math.cos(ang) * rad * size * canopy_rx
+        ey = size * canopy_cy + math.sin(ang) * rad * size * canopy_ry
+        r = rng.uniform(clump_r * 0.55, clump_r) * size
         canopy |= (xx - ex) ** 2 + (yy - ey) ** 2 < r * r
-
-    # Trunk: tapering column from the ground up into the canopy
     trunk = np.zeros((size, size), dtype=bool)
-    for row in range(int(size * 0.40), size):
-        t = (row - size * 0.40) / (size * 0.60)
-        hwd = (0.013 + 0.030 * t) * size
+    t_top = canopy_cy + canopy_ry * 0.3
+    for row in range(int(size * t_top), size):
+        t = (row / size - t_top) / (1.0 - t_top)
+        hwd = trunk_w * (0.45 + 0.55 * t) * size
         trunk[row, int(cx - hwd):int(cx + hwd)] = True
-    # Two branches reaching into the canopy
-    for sgn in (-1, 1):
-        for step in range(int(size * 0.22)):
-            row = int(size * 0.52) - step
+    for sgn in (-1, 1):                              # two branches
+        for step in range(int(size * 0.2)):
+            row = int(size * (t_top + 0.1)) - step
             col = int(cx + sgn * step * 0.7)
             if 0 <= row < size and 2 <= col < size - 2:
                 trunk[row, col - 2:col + 2] = True
-
     alpha = canopy | trunk
-    # Ragged leafy edge: randomly knock pixels out of the boundary band
     edge = alpha & ~binary_erosion(alpha, iterations=2)
-    alpha &= ~(edge & (rng.random((size, size)) < 0.45))
-
-    # Colour: green everywhere (halo-safe), shaded by clump + fine noise,
-    # darker toward the canopy underside; trunk painted brown on top.
+    alpha &= ~(edge & (rng.random((size, size)) < sparse))
     lum = _fbm(size, rng)
     img = np.empty((size, size, 4), dtype=np.float64)
-    depth = np.clip((yy / size - 0.15) * 1.4, 0, 1)          # darker lower
-    img[:, :, 0] = 62 + lum * 30 - depth * 16
-    img[:, :, 1] = 96 + lum * 34 - depth * 22
-    img[:, :, 2] = 48 + lum * 20 - depth * 12
+    depth = np.clip((yy / size - 0.15) * 1.4, 0, 1)
+    img[:, :, 0] = foliage[0] + lum * 30 - depth * 16
+    img[:, :, 1] = foliage[1] + lum * 34 - depth * 22
+    img[:, :, 2] = foliage[2] + lum * 20 - depth * 12
     tv = trunk & ~binary_erosion(canopy, iterations=4)
-    img[tv] = np.column_stack([np.full(tv.sum(), 88.0) + lum[tv] * 20,
-                               np.full(tv.sum(), 66.0) + lum[tv] * 14,
-                               np.full(tv.sum(), 48.0) + lum[tv] * 10,
-                               np.zeros(tv.sum())])
+    for ch in range(3):
+        img[:, :, ch][tv] = trunk_rgb[ch] + lum[tv] * 16
     img[:, :, 3] = np.where(alpha, 255, 0)
-    return _png_encode(size, size,
-                       np.clip(img, 0, 255).astype(np.uint8).tobytes(),
+    return img
+
+
+def _paint_conifer(size, rng, tiers, width, foliage, top=0.03, bot=0.86):
+    """One conifer silhouette tile (RGBA float array)."""
+    from scipy.ndimage import binary_erosion
+    yy, xx = np.mgrid[0:size, 0:size].astype(float)
+    cx = size / 2.0
+    canopy = np.zeros((size, size), dtype=bool)
+    for row in range(int(size * top), int(size * bot)):
+        t = (row / size - top) / (bot - top)
+        tier_ph = (t * tiers) % 1.0
+        w = size * width * (0.12 + 0.88 * t) * (1.0 - 0.32 * tier_ph)
+        w *= rng.uniform(0.92, 1.08)
+        canopy[row, int(cx - w):int(cx + w)] = True
+    trunk = np.zeros((size, size), dtype=bool)
+    hwd = int(size * 0.022)
+    trunk[int(size * (bot - 0.06)):, int(cx - hwd):int(cx + hwd)] = True
+    alpha = canopy | trunk
+    edge = alpha & ~binary_erosion(alpha, iterations=2)
+    alpha &= ~(edge & (rng.random((size, size)) < 0.5))
+    lum = _fbm(size, rng)
+    img = np.empty((size, size, 4), dtype=np.float64)
+    depth = np.clip((yy / size - 0.1) * 1.2, 0, 1)
+    img[:, :, 0] = foliage[0] + lum * 22 - depth * 12
+    img[:, :, 1] = foliage[1] + lum * 26 - depth * 18
+    img[:, :, 2] = foliage[2] + lum * 16 - depth * 10
+    tv = trunk & ~canopy
+    img[tv, 0] = 82; img[tv, 1] = 62; img[tv, 2] = 46
+    img[:, :, 3] = np.where(alpha, 255, 0)
+    return img
+
+
+def build_tree_texture(size: int = 256) -> bytes:
+    """Broadleaf impostor atlas: 4 variants side by side (u = variant/4 …).
+    Repetition of a single silhouette is what reads as fake, so quads pick a
+    random column. Variants: round oak-ish, tall irregular, gum (pale trunk,
+    sparse grey-green canopy), wide spreading."""
+    tiles = [
+        _paint_broadleaf(size, np.random.default_rng(23), 0.34, 0.36, 0.26,
+                         70, 0.13, (62, 96, 48), (88, 66, 48), 0.022),
+        _paint_broadleaf(size, np.random.default_rng(29), 0.30, 0.28, 0.30,
+                         55, 0.11, (70, 92, 44), (92, 72, 52), 0.020),
+        _paint_broadleaf(size, np.random.default_rng(37), 0.26, 0.30, 0.24,
+                         34, 0.09, (96, 108, 78), (196, 182, 158), 0.014,
+                         sparse=0.62),                       # eucalypt
+        _paint_broadleaf(size, np.random.default_rng(43), 0.38, 0.42, 0.22,
+                         80, 0.12, (58, 100, 50), (84, 62, 44), 0.026),
+    ]
+    atlas = np.concatenate(tiles, axis=1)
+    return _png_encode(size * 4, size,
+                       np.clip(atlas, 0, 255).astype(np.uint8).tobytes(),
                        rgba=True)
+
+
+def build_tree2_texture(size: int = 256) -> bytes:
+    """Conifer impostor atlas: 4 variants (pine, tall spruce, broad cypress,
+    wispy casuarina-ish)."""
+    tiles = [
+        _paint_conifer(size, np.random.default_rng(41), 7, 0.40, (48, 72, 44)),
+        _paint_conifer(size, np.random.default_rng(47), 9, 0.30, (42, 64, 42)),
+        _paint_conifer(size, np.random.default_rng(53), 5, 0.46, (56, 78, 48)),
+        _paint_conifer(size, np.random.default_rng(59), 11, 0.26, (58, 70, 52),
+                       top=0.05, bot=0.90),
+    ]
+    atlas = np.concatenate(tiles, axis=1)
+    return _png_encode(size * 4, size,
+                       np.clip(atlas, 0, 255).astype(np.uint8).tobytes(),
+                       rgba=True)
+
+
+def build_treeshadow_texture(size: int = 64) -> bytes:
+    """Soft radial shadow blob laid under each tree. Real-time shadows fade
+    with distance, so a baked ground shadow is what keeps trees looking
+    anchored — standard AC track-making practice."""
+    yy, xx = np.mgrid[0:size, 0:size].astype(float)
+    r = np.sqrt((xx - size/2)**2 + (yy - size/2)**2) / (size/2)
+    a = np.clip(1.0 - r, 0, 1) ** 1.6 * 120.0
+    img = np.zeros((size, size, 4), dtype=np.uint8)
+    img[:, :, 3] = a.astype(np.uint8)                # RGB stays black
+    return _png_encode(size, size, img.tobytes(), rgba=True)
+
+
+def build_terrain_texture(size: int = 256) -> bytes:
+    """Scrubby hillside: green base with dry-earth patches where the coarse
+    noise peaks, so open ground reads as mottled paddock rather than felt."""
+    rng = np.random.default_rng(31)
+    lum = _fbm(size, rng)
+    patch = _fbm(size, rng, octaves=((3, 1.0), (6, 0.6)))
+    img = np.empty((size, size, 3), dtype=np.float64)
+    img[:, :, 0] = 82 + lum * 26
+    img[:, :, 1] = 96 + lum * 26
+    img[:, :, 2] = 54 + lum * 16
+    w = np.clip((patch - 0.18) * 3.0, 0.0, 1.0)[:, :, None]   # dry patches
+    img = img * (1 - w) + np.array([126.0, 108.0, 76.0]) * w
+    return _png_encode(size, size, np.clip(img, 0, 255).astype(np.uint8).tobytes())
 
 
 def build_forest_texture(size: int = 256) -> bytes:
@@ -3520,21 +3929,6 @@ def build_water_texture(size: int = 128) -> bytes:
     noise = rng.integers(-8, 8, size=(size, size, 1))
     base = np.full((size, size, 3), (46, 78, 112), dtype=np.int16) + noise
     return _png_encode(size, size, np.clip(base, 0, 255).astype(np.uint8).tobytes())
-
-
-def build_terrain_texture(size: int = 256) -> bytes:
-    """Scrubby hillside: green base with dry-earth patches where the coarse
-    noise peaks, so open ground reads as mottled paddock rather than felt."""
-    rng = np.random.default_rng(31)
-    lum = _fbm(size, rng)
-    patch = _fbm(size, rng, octaves=((3, 1.0), (6, 0.6)))
-    img = np.empty((size, size, 3), dtype=np.float64)
-    img[:, :, 0] = 82 + lum * 26
-    img[:, :, 1] = 96 + lum * 26
-    img[:, :, 2] = 54 + lum * 16
-    w = np.clip((patch - 0.18) * 3.0, 0.0, 1.0)[:, :, None]   # dry patches
-    img = img * (1 - w) + np.array([126.0, 108.0, 76.0]) * w
-    return _png_encode(size, size, np.clip(img, 0, 255).astype(np.uint8).tobytes())
 
 
 # ─── Track Map (map.png + map.ini + ui images) ────────────────────────────────
@@ -3636,10 +4030,10 @@ class _KN5:
 
     def material(self, name, shader, texture_name,
                  ambient=0.5, diffuse=0.45, specular=0.05, spec_exp=20.0,
-                 alpha_tested=False):
+                 alpha_tested=False, alpha_blend=0):
         self.s(name)
         self.s(shader)
-        self.byte(0)      # alphaBlendMode: Opaque
+        self.byte(alpha_blend)    # alphaBlendMode: 0 opaque, 1 blend
         self.flag(alpha_tested)   # alphaTested (cutout, e.g. tree impostors)
         self.i32(0)       # depthMode: DepthNormal
         props = [("ksAmbient", ambient), ("ksDiffuse", diffuse),
@@ -3665,7 +4059,7 @@ class _KN5:
         self.flag(True)           # active
         self.matrix(right, up, fwd, pos)
 
-    def mesh_node(self, name, verts, indices, material_id):
+    def mesh_node(self, name, verts, indices, material_id, transparent=False):
         """verts: list of (pos3, normal3, uv2, tangent3). indices: flat tri list."""
         if len(verts) > 65535:
             raise ValueError(f"{name}: {len(verts)} verts exceeds 65535 limit")
@@ -3673,9 +4067,9 @@ class _KN5:
         self.s(name)
         self.u32(0)               # children (none allowed for meshes)
         self.flag(True)           # active
-        self.flag(True)           # castShadows
+        self.flag(not transparent)  # castShadows (blended blobs cast none)
         self.flag(True)           # visible
-        self.flag(False)          # transparent
+        self.flag(transparent)    # transparent
         self.u32(len(verts))
         for pos, nrm, uv, tan in verts:
             self.v3(pos); self.v3(nrm); self.v2(uv); self.v3(tan)
@@ -3793,7 +4187,9 @@ def build_kn5(mesh: dict, track_name: str, env_meshes: list = None,
                 ("building2.png", build_building2_texture()),
                 ("tree2.png",     build_tree2_texture()),
                 ("building3.png",  build_building3_texture()),
-                ("commercial.png", build_commercial_texture())]
+                ("commercial.png", build_commercial_texture()),
+                ("treeshadow.png", build_treeshadow_texture()),
+                ("sideroad.png",   build_sideroad_texture())]
     k.i32(len(textures))
     for tex_name, data in textures:
         k.i32(1)                               # active
@@ -3803,8 +4199,9 @@ def build_kn5(mesh: dict, track_name: str, env_meshes: list = None,
     # ── Materials ──
     mat_ids = {"road": 0, "grass": 1, "building": 2, "tree": 3, "terrain": 4,
                "forest": 5, "dirt": 6, "water": 7, "roof": 8, "asphalt": 9,
-               "building2": 10, "tree2": 11, "building3": 12, "commercial": 13}
-    k.i32(14)
+               "building2": 10, "tree2": 11, "building3": 12, "commercial": 13,
+               "treeshadow": 14, "sideroad": 15}
+    k.i32(16)
     _road_style = mesh.get("road_style", "sealed")
     if _road_style == "gravel":               # dirt, not polished bitumen
         k.material("road", "ksPerPixel", "road.png", specular=0.02, spec_exp=8.0)
@@ -3825,6 +4222,9 @@ def build_kn5(mesh: dict, track_name: str, env_meshes: list = None,
                alpha_tested=True)
     k.material("building3", "ksPerPixel", "building3.png",  specular=0.03, spec_exp=10.0)
     k.material("commercial","ksPerPixel", "commercial.png", specular=0.05, spec_exp=14.0)
+    k.material("treeshadow","ksPerPixel", "treeshadow.png", specular=0.0,  spec_exp=1.0,
+               alpha_blend=1)
+    k.material("sideroad",  "ksPerPixel", "sideroad.png",   specular=0.05, spec_exp=18.0)
 
     # ── Geometry ──
     cl = mesh["centerline"]
@@ -3930,7 +4330,8 @@ def build_kn5(mesh: dict, track_name: str, env_meshes: list = None,
     # ── Node tree ── root(identity) → meshes + spawn dummies
     k.dummy_node(track_name, len(meshes) + len(dummies))
     for name, kv, idx, mat_id in meshes:
-        k.mesh_node(name, kv, idx, mat_id)
+        k.mesh_node(name, kv, idx, mat_id,
+                    transparent=name.startswith("ENV_SHADOW"))
     for name, pos, heading in dummies:
         k.dummy_node(name, 0, pos, heading)
 
@@ -4084,6 +4485,30 @@ def build_track_files(mesh: dict, track_name: str, env_meshes: list = None,
     # ai/ folder must exist; AC records fast_lane here on first hotlap
     files["ai/.placeholder"] = b""
 
+    # ── extension/ — CSP config: GrassFX + RainFX ──
+    # Most AC players run Custom Shaders Patch via Content Manager; this
+    # config makes it spawn dense 3D grass on our grass/terrain/forest
+    # materials (occluded by the road surfaces) and marks materials for
+    # rain behaviour. Vanilla AC ignores the folder entirely.
+    files["extension/ext_config.ini"] = (
+        "[ABOUT]\n"
+        f"AUTHOR = road-to-track generator\n"
+        f"VERSION = 1\n"
+        "\n"
+        "[GRASS_FX]\n"
+        "GRASS_MATERIALS = grass, terrain, forest\n"
+        "OCCLUDING_MATERIALS = road, asphalt, dirt, water\n"
+        "ORIGINAL_GRASS_MATERIALS =\n"
+        "SHAPE_SIZE = 1.3\n"
+        "SHAPE_TIDY = 0.2\n"
+        "SHAPE_WIDTH = 1.0\n"
+        "\n"
+        "[RAIN_FX]\n"
+        "PUDDLES_MATERIALS = road, asphalt\n"
+        "SOAKING_MATERIALS = grass, terrain, forest, dirt\n"
+        "SMOOTH_MATERIALS = road, asphalt\n"
+    ).encode()
+
     # ── extras/ — optional Blender workflow for customisation ──
     obj, mtl = build_obj(mesh, track_name)
     if len(obj) <= 5 * 1024 * 1024:   # skip giant OBJs on long tracks
@@ -4174,10 +4599,25 @@ def export_ac_package(coords: list, road_width: float,
     mesh["land_cover"] = lc
     mesh["to_latlon"] = _to_latlon
 
+    # Surroundings are fetched BEFORE terrain so the terrain grid can be
+    # graded along side roads and waterways (shelves cut into hillsides).
+    surroundings = None
+    if include_env:
+        try:
+            print(f"  [export] Fetching surroundings from OSM…")
+            surroundings = fetch_surroundings(coords)
+        except IOError as e:
+            # Overpass fully unavailable: fail the export with a retryable
+            # message rather than shipping a silently barren track.
+            return {"error": str(e)}
+        except Exception as e:
+            print(f"  [export] Surroundings skipped: {e}")
+
     # ── Real terrain beside the road (cliffs, valleys, hillsides) ──
     try:
         tgrid = fetch_terrain_grid(mesh)
-        terrain_meshes = build_terrain_meshes(mesh, tgrid)
+        terrain_meshes = build_terrain_meshes(mesh, tgrid,
+                                              surroundings=surroundings)
     except ElevationUnavailable as e:
         return {"error": f"Terrain elevation unavailable — {e}"}
     if not terrain_meshes:
@@ -4201,20 +4641,14 @@ def export_ac_package(coords: list, road_width: float,
 
     env_meshes = None
     n_bldg = n_tree = 0
-    if include_env:
+    if surroundings is not None:
         try:
-            print(f"  [export] Fetching surroundings from OSM…")
-            surroundings = fetch_surroundings(coords)
             env = build_environment_meshes(surroundings, mesh, ground_pts)
             env_meshes = env["meshes"]
             n_bldg = env["n_buildings"]
             n_tree = env["n_trees"]
             print(f"  [export] Environment: {n_bldg} buildings, {n_tree} trees "
                   f"(incl. forest scatter)")
-        except IOError as e:
-            # Overpass fully unavailable: fail the export with a retryable
-            # message rather than shipping a silently barren track.
-            return {"error": str(e)}
         except Exception as e:
             print(f"  [export] Surroundings skipped: {e}")
 
